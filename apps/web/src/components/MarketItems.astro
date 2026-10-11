@@ -1,0 +1,153 @@
+---
+// Tabla de ítems: nombre, cantidad, ISK total y precio unitario
+import { isk, iskFull } from '../lib/format';
+import { getLang, t } from '../lib/i18n';
+
+export type ItemRow = { typeId: number; name: string | null; quantity: number; isk: number; unitPrice: number };
+
+interface Props {
+  title: string;
+  items: ItemRow[];
+  iskLabel?: string;
+  priceLabel?: string;
+  empty?: string;
+  // Nota bajo la tabla (cómo se valora, p. ej.)
+  note?: string;
+}
+const lang = getLang(Astro);
+const m = t(lang);
+const fmt = (v: number, o: { sign?: boolean } = {}) => isk(v, { ...o, lang });
+const full = (v: number) => iskFull(v, lang);
+const { title, items, iskLabel = m.isk, priceLabel = m.avgPrice, empty = m.noTransactions, note } = Astro.props;
+const qty = new Intl.NumberFormat(lang);
+---
+
+<section class="panel">
+  <div class="panel-heading">
+    <h2>{title}</h2>
+    {items.length > 0 && <span class="meta">{m.top(items.length)}</span>}
+  </div>
+  {
+    items.length === 0 ? (
+      <p class="empty panel-body">{empty}</p>
+    ) : (
+      <div class="scroll" role="group" aria-label={title}>
+        <table>
+          <thead>
+            <tr>
+              <th>{m.item}</th>
+              <th>{m.quantity}</th>
+              <th>{iskLabel}</th>
+              <th>{priceLabel}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((it) => (
+              <tr>
+                <td>
+                  <span class="item">
+                    <span class="thumb">
+                      <img
+                        src={`https://images.evetech.net/types/${it.typeId}/icon?size=32`}
+                        alt=""
+                        width="24"
+                        height="24"
+                        loading="lazy"
+                        onerror="this.style.visibility='hidden'"
+                      />
+                    </span>
+                    <span class="name" title={it.name ?? undefined}>{it.name ?? `#${it.typeId}`}</span>
+                  </span>
+                </td>
+                <td>{qty.format(it.quantity)}</td>
+                {it.unitPrice > 0 ? (
+                  <>
+                    <td title={`${full(it.isk)} · ${m.each(full(it.unitPrice))}`}>{fmt(it.isk)}</td>
+                    <td title={full(it.unitPrice)}>{fmt(it.unitPrice)}</td>
+                  </>
+                ) : (
+                  <>
+                    <td class="muted" title={m.noPrice}>—</td>
+                    <td class="muted" title={m.noPriceTitle}>—</td>
+                  </>
+                )}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )
+  }
+  {items.length > 0 && note && <p class="panel-note">{note}</p>}
+</section>
+
+<style>
+  /* La tarjeta es el contenedor: el precio unitario se oculta según su ancho, no el de la ventana */
+  .panel {
+    container-type: inline-size;
+  }
+  @container (max-width: 520px) {
+    th:nth-child(4),
+    td:nth-child(4) {
+      display: none;
+    }
+    table th:nth-child(3),
+    table td:nth-child(3) {
+      padding-right: 22px;
+    }
+  }
+  /* Filas más compactas: 8 ítems ocupaban 400 px junto a una lista de 5 ubicaciones */
+  table td {
+    padding-block: 7px;
+  }
+  table th:first-child,
+  table td:first-child {
+    padding-left: 22px;
+  }
+  table th:last-child,
+  table td:last-child {
+    padding-right: 22px;
+  }
+  .item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    max-width: 16rem;
+  }
+  .thumb {
+    display: grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    flex-shrink: 0;
+    border: 1px solid #2b4251;
+    border-radius: 5px;
+    background: #162834;
+  }
+  .name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .empty {
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+  /* En móvil: sin precio unitario (queda en el tooltip del total) y celdas más compactas */
+  @media (max-width: 480px) {
+    th,
+    td {
+      padding: 8px 6px;
+    }
+    table th:first-child,
+    table td:first-child {
+      padding-left: 16px;
+    }
+    table th:nth-child(3),
+    table td:nth-child(3) {
+      padding-right: 16px;
+    }
+    .item {
+      max-width: 9rem;
+    }
+  }
+</style>

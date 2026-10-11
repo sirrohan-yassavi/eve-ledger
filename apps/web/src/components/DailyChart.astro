@@ -1,0 +1,520 @@
+---
+// Columnas divergentes por día: ingresos hacia arriba, gastos hacia abajo, un solo eje
+import type { Summary } from '../lib/api';
+import { isk, iskFull, shortDate } from '../lib/format';
+import { getLang, t } from '../lib/i18n';
+
+interface Props {
+  daily: Summary['daily'];
+  // Primer día con historial (YYYY-MM-DD): lo anterior no es «cero», es «sin datos»
+  firstDate?: string | null;
+  // Día del último sync de un piloto atascado (YYYY-MM-DD): lo posterior tampoco es «cero»
+  lastDate?: string | null;
+}
+const { daily, firstDate, lastDate } = Astro.props;
+const lang = getLang(Astro);
+const m = t(lang);
+const fmt = (v: number, o: { sign?: boolean } = {}) => isk(v, { ...o, lang });
+const full = (v: number) => iskFull(v, lang);
+const date = (iso: string) => shortDate(iso, lang);
+// Gasto con signo, sin «−0» en los días sin gastos
+const out = (v: number) => (v ? -v : 0);
+
+const missing = firstDate ? daily.filter((d) => d.date < firstDate).length : 0;
+const trailing = lastDate ? daily.filter((d) => d.date > lastDate).length : 0;
+const known = (i: number) => i >= missing && i < daily.length - trailing;
+
+function niceStep(range: number, count = 4) {
+  if (range <= 0) return 1;
+  const raw = range / count;
+  const mag = 10 ** Math.floor(Math.log10(raw));
+  const norm = raw / mag;
+  return (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 2.5 ? 2.5 : norm <= 5 ? 5 : 10) * mag;
+}
+
+// El eje cubre también el punto del neto (hoy siempre está entre las dos barras; antes, en la vista de un piloto,
+// incluía lo movido con tus otros pilotos y un día que recibió 6 B dejaba el punto fuera del gráfico)
+const maxIn = Math.max(0, ...daily.map((d) => Math.max(d.income, d.net)));
+const maxOut = Math.max(0, ...daily.map((d) => Math.max(d.expenses, -d.net)));
+const step = niceStep(maxIn + maxOut, 8);
+const top = Math.max(step, Math.ceil(maxIn / step) * step);
+const bottom = Math.ceil(maxOut / step) * step;
+const span = top + bottom;
+const pct = (v: number) => (v / span) * 100;
+const zero = pct(bottom); // altura de la línea base desde abajo, en %
+
+const ticks: number[] = [];
+for (let v = -bottom; v <= top + step / 2; v += step) ticks.push(Math.round(v));
+
+// Etiquetas del eje en una sola unidad y con los mismos decimales (antes se mezclaban «50,0 M», «150 M» y «0»)
+const axisMax = Math.max(top, bottom);
+const [unit, suffix] = axisMax >= 1e9 ? [1e9, ' B'] : axisMax >= 1e6 ? [1e6, ' M'] : axisMax >= 1e3 ? [1e3, ' k'] : [1, ''];
+const axisDigits = Number.isInteger(step / unit) ? 0 : 1;
+const axisNum = new Intl.NumberFormat(lang, { minimumFractionDigits: axisDigits, maximumFractionDigits: axisDigits });
+const axisLabel = (v: number) => (v === 0 ? '0' : `${v < 0 ? '−' : ''}${axisNum.format(Math.abs(v) / unit)}${suffix}`);
+
+// Etiquetas del eje X: primera, última y una por semana
+const labelEvery = daily.length > 14 ? 7 : daily.length > 7 ? 2 : 1;
+const showLabel = (i: number) => i === daily.length - 1 || (daily.length - 1 - i) % labelEvery === 0;
+
+// Una sola parada de Tab (roving tabindex): entra por el último día con movimientos y se recorre con las flechas
+const hintId = 'daily-chart-hint';
+const hasActivity = (d: (typeof daily)[number]) => d.income > 0 || d.expenses > 0;
+const lastActive = daily.reduce((last, d, i) => (known(i) && hasActivity(d) ? i : last), -1);
+const entry = lastActive >= 0 ? lastActive : Math.max(missing, daily.length - 1 - trailing);
+// Cifras abreviadas (k/M/B) en el tooltip y para el lector de pantalla; las completas están en la tabla
+const short = (v: number, o: { sign?: boolean } = {}) => `${fmt(v, o)} ISK`;
+// Tabla: cifra completa sin repetir «ISK» en cada celda (la unidad va en el encabezado)
+const wholeIsk = new Intl.NumberFormat(lang, { maximumFractionDigits: 0 });
+const plain = (v: number) => wholeIsk.format(v).replace('-', '−');
+// PLEX (coste de las cuentas, aparte del resultado de juego): la parte de la barra que es PLEX va rayada
+const hasPlex = daily.some((d) => Math.abs(d.accounts ?? 0) >= 0.5);
+const plexShare = (part: number, whole: number) => Math.min(100, (Math.abs(part) / whole) * 100);
+---
+
+<div class="legend" aria-hidden="true">
+  <span><i class="key income"></i>{m.income}</span>
+  <span><i class="key expenses"></i>{m.expenses}</span>
+  <span><i class="key net"></i>{m.net}</span>
+  {hasPlex && <span><i class="key plex"></i>{m.chartPlex}</span>}
+</div>
+
+<div
+  class="chart"
+  role="group"
+  aria-label={m.chartLabel}
+  aria-describedby={hintId}
+  data-l-income={m.income}
+  data-l-expenses={m.expenses}
+  data-l-net={m.net}
+  data-l-plex={m.chartPlexTip}
+>
+  <div class="y-axis" aria-hidden="true">
+    {ticks.map((t) => <span style={`bottom:${pct(t + bottom)}%`}>{axisLabel(t)}</span>)}
+  </div>
+  <div class="plot">
+    {ticks.map((t) => <div class:list={['grid', { base: t === 0 }]} style={`bottom:${pct(t + bottom)}%`} />)}
+    {
+      missing > 0 && (
+        <div class="nodata-band" style={`width:${(missing / daily.length) * 100}%`}>
+          {/* Con pocos días la franja es estrecha: la etiqueta solo si cabe (si no, se leía «Sin h») */}
+          {missing / daily.length >= 0.15 && <span>{m.noHistory}</span>}
+        </div>
+      )
+    }
+    {
+      trailing > 0 && (
+        <div class="nodata-band after" style={`width:${(trailing / daily.length) * 100}%`}>
+          {/* Con pocos días la franja es estrecha: la etiqueta solo si cabe */}
+          {trailing / daily.length >= 0.15 && <span>{m.noSyncData}</span>}
+        </div>
+      )
+    }
+    <div class="cols" role="list">
+      {
+        daily.map((d, i) => (
+          !known(i) ? (
+            <div class="col nodata" aria-hidden="true" />
+          ) : (
+          <div
+            class="col"
+            role="listitem"
+            tabindex={i === entry ? 0 : -1}
+            aria-label={
+              m.chartDay(date(d.date), short(d.income), short(out(d.expenses)), short(d.net, { sign: true })) +
+              (Math.abs(d.accounts ?? 0) >= 0.5 ? m.chartDayPlex(short(d.accounts, { sign: true })) : '')
+            }
+            data-date={date(d.date)}
+            data-income={short(d.income)}
+            data-expenses={short(out(d.expenses))}
+            data-net={short(d.net, { sign: true })}
+            data-plex={Math.abs(d.accounts ?? 0) >= 0.5 ? short(d.accounts, { sign: true }) : undefined}
+          >
+            {d.income > 0 && (
+              <div class="bar income" style={`bottom:${zero}%;height:${pct(d.income)}%`}>
+                {d.accounts > 0 && <i class="plex-part top" style={`height:${plexShare(d.accounts, d.income)}%`} />}
+              </div>
+            )}
+            {d.expenses > 0 && (
+              <div class="bar expenses" style={`top:${100 - zero}%;height:${pct(d.expenses)}%`}>
+                {d.accounts < 0 && <i class="plex-part bottom" style={`height:${plexShare(d.accounts, d.expenses)}%`} />}
+              </div>
+            )}
+            {/* Neto del día: un punto neutro sobre el eje; la barra sola no dice si el día cerró en positivo o en negativo */}
+            {hasActivity(d) && <i class="net-mark" aria-hidden="true" style={`bottom:${pct(d.net + bottom)}%`} />}
+            {/* Día sin movimientos: una marca corta en el eje; los días anteriores al historial van rayados */}
+            {!hasActivity(d) && <i class="zero-mark" aria-hidden="true" style={`bottom:${zero}%`} />}
+          </div>
+          )
+        ))
+      }
+    </div>
+  </div>
+  <div class="x-axis" aria-hidden="true">
+    {
+      daily.map((d, i) => (
+        // data-k: pasos de etiqueta desde el último día (0 = el último); el script omite los impares si no caben
+        <span data-k={showLabel(i) ? (daily.length - 1 - i) / labelEvery : undefined}>{showLabel(i) ? date(d.date) : ''}</span>
+      ))
+    }
+  </div>
+  <!-- Visual: el lector de pantalla ya lee la etiqueta del día enfocado -->
+  <div class="tooltip" aria-hidden="true" hidden></div>
+  <p class="hint" id={hintId}>{m.chartHint}</p>
+</div>
+
+<details class="table-view">
+  <summary>{m.asTable}</summary>
+  <div class="scroll" role="group" aria-label={m.dailyFlow}>
+    <table>
+      <caption class="sr-only">{m.dailyFlow}</caption>
+      <thead>
+        <tr>
+          <th>{m.day}</th>
+          <th>{m.income} <span class="unit">ISK</span></th>
+          <th>{m.expenses} <span class="unit">ISK</span></th>
+          <th>{m.net} <span class="unit">ISK</span></th>
+        </tr>
+      </thead>
+      <tbody>
+        {
+          [...daily].reverse().map((d) => (
+            <tr>
+              <td>{date(d.date)}</td>
+              <td>{plain(d.income)}</td>
+              <td>{plain(out(d.expenses))}</td>
+              <td>{plain(d.net)}</td>
+            </tr>
+          ))
+        }
+      </tbody>
+    </table>
+  </div>
+</details>
+
+<script>
+  for (const chart of document.querySelectorAll<HTMLElement>('.chart')) {
+    const tip = chart.querySelector<HTMLElement>('.tooltip')!;
+    const cols = [...chart.querySelectorAll<HTMLElement>('.col:not(.nodata)')];
+    const show = (col: HTMLElement) => {
+      const { date, income, expenses, net, plex } = col.dataset;
+      const l = chart.dataset;
+      tip.innerHTML = `<strong>${date}</strong>
+        <span><i class="key income"></i>${l.lIncome}</span><b>${income}</b>
+        <span><i class="key expenses"></i>${l.lExpenses}</span><b>${expenses}</b>
+        <span>${l.lNet}</span><b>${net}</b>${plex ? `<span><i class="key plex"></i>${l.lPlex}</span><b>${plex}</b>` : ''}`;
+      tip.hidden = false;
+      // Al lado de la columna (derecha si cabe, si no izquierda) para no tapar sus barras
+      const c = chart.getBoundingClientRect();
+      const r = col.getBoundingClientRect();
+      const right = r.right - c.left + 8;
+      const left = right + tip.offsetWidth <= c.width ? right : Math.max(r.left - c.left - 8 - tip.offsetWidth, 0);
+      tip.style.left = `${left}px`;
+    };
+    const hide = () => (tip.hidden = true);
+    // Etiquetas del eje X: si la cadencia deja menos de ~64 px por etiqueta (móvil, 90 días), muestra una de cada n
+    const axis = chart.querySelector<HTMLElement>('.x-axis')!;
+    const labelled = [...axis.querySelectorAll<HTMLElement>('span[data-k]')];
+    const fitLabels = () => {
+      if (labelled.length < 2) return;
+      const gap = labelled[labelled.length - 1].offsetLeft - labelled[labelled.length - 2].offsetLeft;
+      const stride = Math.max(1, Math.ceil(64 / Math.max(gap, 1)));
+      for (const label of labelled) label.classList.toggle('skip', Number(label.dataset.k) % stride !== 0);
+    };
+    fitLabels();
+    new ResizeObserver(fitLabels).observe(axis);
+    const focusAt = (i: number) => {
+      const next = cols[Math.min(Math.max(i, 0), cols.length - 1)];
+      if (!next) return;
+      for (const col of cols) col.tabIndex = col === next ? 0 : -1;
+      next.focus();
+    };
+    for (const col of cols) {
+      col.addEventListener('pointerenter', () => show(col));
+      col.addEventListener('focus', () => show(col));
+      // Un clic también mueve la parada de Tab a ese día
+      col.addEventListener('pointerdown', () => {
+        for (const c of cols) c.tabIndex = c === col ? 0 : -1;
+      });
+    }
+    chart.addEventListener('keydown', (e) => {
+      const i = cols.indexOf(document.activeElement as HTMLElement);
+      if (i < 0) return;
+      const step: Record<string, number> = { ArrowLeft: -1, ArrowRight: 1, PageUp: -7, PageDown: 7 };
+      if (e.key in step) focusAt(i + step[e.key]);
+      else if (e.key === 'Home') focusAt(0);
+      else if (e.key === 'End') focusAt(cols.length - 1);
+      else if (e.key === 'Escape') return hide();
+      else return;
+      e.preventDefault();
+    });
+    chart.addEventListener('pointerleave', () => {
+      if (!chart.contains(document.activeElement)) hide();
+    });
+    chart.addEventListener('focusout', (e) => {
+      if (!chart.contains(e.relatedTarget as Node)) hide();
+    });
+  }
+</script>
+
+<style>
+  .legend {
+    display: flex;
+    gap: 18px;
+    font-size: 13px;
+    color: var(--text-secondary);
+    margin-bottom: 14px;
+  }
+  .legend span {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  :global(.key) {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+  }
+  :global(.key.income) {
+    background: var(--income);
+  }
+  :global(.key.expenses) {
+    background: var(--expenses);
+  }
+  /* Neto: punto en el color del texto, no en el de ingresos ni gastos */
+  :global(.key.net) {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text);
+  }
+
+  .chart {
+    position: relative;
+    /* Margen para que la última etiqueta, centrada bajo su columna, no se recorte en el borde del panel */
+    padding-right: 8px;
+    display: grid;
+    grid-template-columns: auto 1fr;
+    grid-template-rows: 220px auto;
+    column-gap: 8px;
+  }
+  @media (max-width: 600px) {
+    /* La última etiqueta de 7 caracteres sobresale ~23 px por la derecha de la columna: margen para que no toque el borde */
+    .chart {
+      padding-right: 22px;
+    }
+  }
+  .y-axis {
+    position: relative;
+    min-width: 52px;
+  }
+  .y-axis span {
+    position: absolute;
+    right: 0;
+    transform: translateY(50%);
+    font: 12px var(--mono);
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+  .plot {
+    position: relative;
+  }
+  .grid {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: var(--grid);
+  }
+  .grid.base {
+    background: var(--axis);
+  }
+  .cols {
+    position: absolute;
+    inset: 0;
+    display: flex;
+  }
+  .col {
+    position: relative;
+    flex: 1;
+    border-radius: 4px;
+  }
+  .col:hover,
+  .col:focus-visible {
+    background: linear-gradient(180deg, transparent, #61cce524 50%, transparent);
+  }
+  /* Anillo de foco de 2 px dentro de la columna (sin desplazamiento: las columnas están pegadas) */
+  .col:focus-visible {
+    outline: 2px solid var(--cyan);
+    outline-offset: -1px;
+  }
+  /* Día sin movimientos: una marca corta en el eje */
+  .zero-mark {
+    position: absolute;
+    left: 25%;
+    right: 25%;
+    height: 2px;
+    margin-bottom: -1px;
+    border-radius: 1px;
+    background: var(--text-muted);
+  }
+  /* Días sin datos (antes del primer sync o después del último de un piloto atascado): textura diagonal,
+     sin barras ni tooltip */
+  .nodata-band {
+    position: absolute;
+    inset: 0 auto 0 0;
+    overflow: hidden;
+    display: grid;
+    place-items: center;
+    border-radius: 4px;
+    background: repeating-linear-gradient(135deg, #ffffff06 0 6px, transparent 6px 12px);
+    border: 1px dashed var(--line-strong);
+    pointer-events: none;
+  }
+  .nodata-band.after {
+    inset: 0 0 0 auto;
+  }
+  .nodata-band span {
+    white-space: nowrap;
+    padding: 2px 8px;
+    border-radius: 4px;
+    background: var(--panel);
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  .net-mark {
+    position: absolute;
+    left: 50%;
+    width: 7px;
+    height: 7px;
+    margin-bottom: -3.5px;
+    transform: translateX(-50%);
+    border-radius: 50%;
+    background: var(--text);
+    /* Anillo del color del panel para separarlo de la barra que cruza */
+    box-shadow: 0 0 0 2px #0f1822;
+    pointer-events: none;
+  }
+  .bar {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    width: calc(100% - 2px);
+    max-width: 24px;
+  }
+  .bar.income {
+    background: var(--income);
+    border-radius: 4px 4px 0 0;
+  }
+  .bar.expenses {
+    background: var(--expenses);
+    border-radius: 0 0 4px 4px;
+  }
+  /* La parte de la barra que es PLEX: rayada sobre el color de la barra (sigue siendo ingreso o gasto) */
+  .plex-part {
+    position: absolute;
+    left: 0;
+    right: 0;
+    background: repeating-linear-gradient(135deg, #0f1822 0 2px, transparent 2px 5px);
+  }
+  .plex-part.bottom {
+    bottom: 0;
+    border-radius: 0 0 4px 4px;
+  }
+  .plex-part.top {
+    top: 0;
+    border-radius: 4px 4px 0 0;
+  }
+  :global(.key.plex) {
+    background: repeating-linear-gradient(135deg, #0f1822 0 2px, transparent 2px 5px), var(--expenses);
+  }
+  .x-axis {
+    grid-column: 2;
+    display: flex;
+    padding-top: 6px;
+  }
+  .x-axis span {
+    flex: 1;
+    font: 12px var(--mono);
+    color: var(--text-muted);
+    text-align: center;
+    white-space: nowrap;
+    overflow: visible;
+    width: 0;
+    display: flex;
+    justify-content: center;
+  }
+  /* Etiquetas que no caben en el ancho disponible: las omite el script, sin cambiar la cadencia del resto */
+  .x-axis span.skip {
+    visibility: hidden;
+  }
+  .tooltip {
+    position: absolute;
+    top: -8px;
+    z-index: 1;
+    display: grid;
+    grid-template-columns: auto auto;
+    gap: 4px 16px;
+    padding: 10px 12px;
+    font-size: 13px;
+    background: #0d1a25f2;
+    color: var(--text-primary);
+    border: 1px solid #345469;
+    border-radius: 6px;
+    box-shadow:
+      0 10px 40px #0009,
+      inset 0 1px 0 #64c9e233;
+    pointer-events: none;
+    white-space: nowrap;
+  }
+  .tooltip :global(strong) {
+    grid-column: 1 / -1;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .tooltip :global(span) {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-secondary);
+  }
+  .tooltip :global(b) {
+    text-align: right;
+    font: 500 13px var(--mono);
+  }
+  .tooltip[hidden] {
+    display: none;
+  }
+  /* La pista de teclado solo se ve mientras el gráfico tiene el foco */
+  .hint {
+    grid-column: 2;
+    margin: 8px 0 0;
+    font-size: 13px;
+    color: var(--text-muted);
+    visibility: hidden;
+  }
+  .chart:focus-within .hint {
+    visibility: visible;
+  }
+  .table-view {
+    margin-top: 4px;
+    font-size: 13px;
+  }
+  .table-view summary {
+    cursor: pointer;
+    padding: 12px 0;
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+  .table-view summary:hover {
+    color: var(--cyan);
+  }
+  .table-view .scroll {
+    margin-top: 8px;
+  }
+  .unit {
+    font-weight: 400;
+    color: var(--text-muted);
+  }
+</style>

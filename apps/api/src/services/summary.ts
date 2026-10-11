@@ -1,0 +1,426 @@
+import { and, asc, desc, eq, gte, inArray, lt, min, sql, type SQL } from 'drizzle-orm';
+import { db } from '../db/client';
+import { characters, walletJournal, walletTransactions } from '../db/schema';
+import { ACTIVITIES, activityOf, PLEX_TYPE_ID, refKindOf } from '../lib/activities';
+import { REPLACEMENT_DAYS, shipLosses } from './losses';
+import { marketReview } from './transactions';
+
+const DAY_MS = 86_400_000;
+
+// La transacción de mercado de un movimiento del journal (mismo piloto, journal_ref_id = journal_id): su
+// contraparte (client_id) y su id, que comparten los dos lados de una compraventa entre tus pilotos
+const linkedTx = (col: string) =>
+  sql.raw(
+    `(select t.${col} from wallet_transactions t where t.character_id = wallet_journal.character_id and t.journal_ref_id = wallet_journal.journal_id limit 1)`,
+  );
+const txClient = linkedTx('client_id');
+const txId = linkedTx('transaction_id');
+
+// Transferencias entre mis propios personajes: en el consolidado se anulan
+// (una sale de un wallet y entra en otro), así que no cuentan como ingreso ni gasto.
+// - Dos pilotos DISTINTOS en las partes: donaciones, contratos, trades y el lado del vendedor de una compraventa.
+// - Una compra de mercado (market_escrow) lleva al propio comprador en las dos partes: es un gasto salvo que su
+//   transacción tenga como contraparte a otro de tus pilotos (comprar la orden de venta de tu alter), y por el
+//   importe entero de esa transacción (una orden de compra que llenan varios vendedores no se anula)
+export const isInternal = sql<number>`(case
+  when ${walletJournal.firstPartyId} in (select id from characters)
+    and ${walletJournal.secondPartyId} in (select id from characters)
+    and ${walletJournal.firstPartyId} <> ${walletJournal.secondPartyId} then 1
+  when ${walletJournal.refType} = 'market_escrow' and exists (
+    select 1 from wallet_transactions t
+    where t.character_id = ${walletJournal.characterId} and t.journal_ref_id = ${walletJournal.journalId}
+      and t.client_id in (select id from characters) and t.client_id <> ${walletJournal.characterId}
+      and abs(t.quantity * t.unit_price + ${walletJournal.amount}) < 0.01
+  ) then 1
+  else 0 end)`;
+
+const income = sql<number>`coalesce(sum(case when ${walletJournal.amount} > 0 then ${walletJournal.amount} end), 0)`;
+const expenses = sql<number>`coalesce(sum(case when ${walletJournal.amount} < 0 then -${walletJournal.amount} end), 0)`;
+
+export type Totals = { income: number; expenses: number; net: number };
+
+// Tipo de movimiento para el detalle: el ref_type de ESI, salvo escalaciones vendidas y loot del buyback
+const refKind = refKindOf(walletJournal.refType, walletJournal.amount, walletJournal.firstPartyId);
+export const activity = activityOf(walletJournal.refType, walletJournal.contextId, refKind);
+
+const withNet = <T extends { income: number; expenses: number }>(r: T): T & { net: number } => ({
+  ...r,
+  net: r.income - r.expenses,
+});
+
+// Fecha UTC (hora de EVE) en formato YYYY-MM-DD
+const isoDay = (d: Date) => d.toISOString().slice(0, 10);
+
+// Ingresos, gastos y neto entre dos instantes, sin transferencias internas. Brutos: las compras de
+// mercado son gasto y las ventas ingreso; el margen del trading solo se muestra en byActivity
+async function flowBetween(pilot: SQL | undefined, from: Date, to?: Date, withoutAccounts = false) {
+  const [row] = await db
+    .select({ income, expenses })
+    .from(walletJournal)
+    .where(
+      and(
+        gte(walletJournal.date, from),
+        to ? lt(walletJournal.date, to) : undefined,
+        eq(isInternal, 0),
+        pilot,
+        withoutAccounts ? sql`${activity} <> 'accounts'` : undefined,
+      ),
+    );
+  return withNet(row);
+}
+
+// Neto diario de un piloto en los últimos `days` días, medido solo sobre los días de los que hay datos:
+// desde su primer movimiento (si es posterior al inicio) hasta su último sync. Un piloto con el sync
+// atascado cuenta con su ritmo hasta ese sync; sin sync, o sin datos en la ventana, devuelve null
+export async function dailyNetRate(characterId: number, lastSyncAt: Date | null, days: number) {
+  if (!lastSyncAt) return null;
+  const now = new Date();
+  const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const windowFrom = new Date(todayStart.getTime() - (days - 1) * DAY_MS);
+  const [first] = await db
+    .select({ at: min(walletJournal.date) })
+    .from(walletJournal)
+    .where(eq(walletJournal.characterId, characterId));
+  const from = first?.at && first.at > windowFrom ? first.at : windowFrom;
+  const to = lastSyncAt < now ? lastSyncAt : now;
+  const span = (to.getTime() - from.getTime()) / DAY_MS;
+  if (span <= 0) return null;
+  // Sin el PLEX: comprarlo ES pagar el Omega, no el ritmo con el que lo pagas
+  const flow = await flowBetween(eq(walletJournal.characterId, characterId), from, to, true);
+  // Menos de un día de datos: se divide por un día entero para no inflar el ritmo
+  return flow.net / Math.max(1, span);
+}
+
+// PLEX comprado y vendido en el mercado en el período (sin operaciones entre tus pilotos)
+async function plexTraded(from: Date, characterId?: number) {
+  const [row] = await db
+    .select({
+      bought: sql<number>`coalesce(sum(case when ${walletTransactions.isBuy} = 1 then ${walletTransactions.quantity} end), 0)`,
+      sold: sql<number>`coalesce(sum(case when ${walletTransactions.isBuy} = 0 then ${walletTransactions.quantity} end), 0)`,
+    })
+    .from(walletTransactions)
+    .where(
+      and(
+        eq(walletTransactions.typeId, PLEX_TYPE_ID),
+        gte(walletTransactions.date, from),
+        sql`(${walletTransactions.clientId} is null or ${walletTransactions.clientId} not in (select id from characters))`,
+        characterId ? eq(walletTransactions.characterId, characterId) : undefined,
+      ),
+    );
+  return { plexBought: row?.bought ?? 0, plexSold: row?.sold ?? 0 };
+}
+
+// characterId opcional: el ledger de un solo piloto. Las transferencias entre tus pilotos no cuentan en
+// ningún neto (mover ISK no es ganarlo); la lista de pilotos se devuelve siempre completa.
+// Saldo = el balance del último movimiento sincronizado del personaje
+// Saldo anterior: el balance con el que el piloto entró en el período (el de su último movimiento antes de
+// `from`). Si su historial empieza dentro del período, el balance de su primer movimiento menos ese movimiento,
+// y `partial` lo dice. Saldo anterior + variación del wallet = saldo, salvo movimientos que ESI ya no daba
+export async function openingBalance(characterId: number, from: Date) {
+  const [before] = await db
+    .select({ balance: walletJournal.balance, date: walletJournal.date })
+    .from(walletJournal)
+    .where(and(eq(walletJournal.characterId, characterId), lt(walletJournal.date, from)))
+    .orderBy(desc(walletJournal.date), desc(walletJournal.journalId))
+    .limit(1);
+  if (before?.balance != null) return { balance: before.balance, at: before.date, partial: false };
+  const [first] = await db
+    .select({ balance: walletJournal.balance, amount: walletJournal.amount, date: walletJournal.date })
+    .from(walletJournal)
+    .where(and(eq(walletJournal.characterId, characterId), gte(walletJournal.date, from)))
+    .orderBy(asc(walletJournal.date), asc(walletJournal.journalId))
+    .limit(1);
+  if (first?.balance != null) return { balance: first.balance - first.amount, at: first.date, partial: true };
+  return { balance: null, at: null, partial: true };
+}
+
+export async function lastBalance(characterId: number) {
+  const [last] = await db
+    .select({ balance: walletJournal.balance, date: walletJournal.date })
+    .from(walletJournal)
+    .where(eq(walletJournal.characterId, characterId))
+    .orderBy(desc(walletJournal.date), desc(walletJournal.journalId))
+    .limit(1);
+  return last;
+}
+
+export async function getSummary(days: number, characterId?: number) {
+  const now = new Date();
+  // Desde el inicio del día UTC, para que el primer día de la serie esté completo
+  const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const from = new Date(todayStart.getTime() - (days - 1) * DAY_MS);
+  const pilot = characterId ? eq(walletJournal.characterId, characterId) : undefined;
+  const allPilots = and(gte(walletJournal.date, from), eq(isInternal, 0));
+  const inPeriod = and(allPilots, pilot);
+
+  const activityRows = await db
+    .select({ activity, income, expenses, count: sql<number>`count(*)` })
+    .from(walletJournal)
+    .where(inPeriod)
+    .groupBy(activity);
+  const totals = withNet({
+    income: activityRows.reduce((n, r) => n + r.income, 0),
+    expenses: activityRows.reduce((n, r) => n + r.expenses, 0),
+  });
+
+  // «Hoy» = día de EVE en curso (desde 00:00 UTC) y el período anterior de igual duración
+  const today = await flowBetween(pilot, todayStart);
+  const previousFrom = new Date(from.getTime() - days * DAY_MS);
+  const previous = await flowBetween(pilot, previousFrom, from);
+
+  // Cobertura: el historial empieza con el primer movimiento guardado, no con el período pedido
+  const [first] = await db.select({ at: min(walletJournal.date) }).from(walletJournal).where(pilot);
+  const firstEntryAt = first?.at ?? null;
+  const coveredDays = !firstEntryAt
+    ? 0
+    : firstEntryAt <= from
+      ? days
+      : Math.floor((todayStart.getTime() - Date.UTC(firstEntryAt.getUTCFullYear(), firstEntryAt.getUTCMonth(), firstEntryAt.getUTCDate())) / DAY_MS) + 1;
+  // El período anterior solo es comparable si el historial lo cubre entero
+  const previousComplete = !!firstEntryAt && firstEntryAt <= previousFrom;
+
+  // Movido entre tus pilotos en el período: quién envió y quién recibió cada
+  // transferencia. ESI da el mismo id a los dos lados y basta uno para saberlo (el signo dice quién paga; la otra
+  // parte es el otro piloto), así que cuadra también con movimientos de antes de que el journal guardara los dos
+  // lados (migración 0007). No cuentan en ningún neto (decisión del usuario: el neto de un piloto es lo ganado en
+  // juego; mover ISK no es ganarlo). Van aparte para la conciliación: saldo anterior + neto + entre tus pilotos = saldo
+  const internalRows = await db
+    .select({
+      journalId: walletJournal.journalId,
+      characterId: walletJournal.characterId,
+      amount: walletJournal.amount,
+      date: walletJournal.date,
+      firstPartyId: walletJournal.firstPartyId,
+      secondPartyId: walletJournal.secondPartyId,
+      txClient: sql<number | null>`${txClient}`,
+      txId: sql<number | null>`${txId}`,
+    })
+    .from(walletJournal)
+    .where(and(gte(walletJournal.date, from), eq(isInternal, 1)));
+  // Una transferencia por clave: el id de la transacción en una compraventa de mercado (el escrow del comprador
+  // y el market_transaction del vendedor tienen ids de journal distintos), el del journal en lo demás
+  const transfers = new Map<string, { from: number; to: number; amount: number; date: Date }>();
+  for (const r of internalRows) {
+    const key = r.txId !== null ? `tx${r.txId}` : `j${r.journalId}`;
+    if (transfers.has(key) || !r.amount) continue;
+    // La otra parte: la que no es este piloto; en el escrow del comprador (él en las dos), el cliente de la transacción
+    const other =
+      r.firstPartyId !== r.characterId ? r.firstPartyId! : r.secondPartyId !== r.characterId ? r.secondPartyId! : r.txClient!;
+    const [sender, receiver] = r.amount < 0 ? [r.characterId, other] : [other, r.characterId];
+    transfers.set(key, { from: sender, to: receiver, amount: Math.abs(r.amount), date: r.date });
+  }
+  // Recibido y enviado por un piloto (o movido entre todos) entre dos instantes
+  const internalBetween = (id: number | undefined, a: Date, b?: Date) => {
+    let received = 0;
+    let sent = 0;
+    for (const t of transfers.values()) {
+      if (t.date < a || (b && t.date >= b)) continue;
+      if (id === undefined) received += t.amount;
+      else {
+        if (t.to === id) received += t.amount;
+        if (t.from === id) sent += t.amount;
+      }
+    }
+    return id === undefined ? { received, sent: received } : { received, sent };
+  };
+  const internal = internalBetween(characterId, from);
+  const internalByCharacter = new Map<number, { received: number; sent: number }>();
+  for (const t of transfers.values()) {
+    if (t.date < from) continue;
+    const s = internalByCharacter.get(t.from) ?? { received: 0, sent: 0 };
+    s.sent += t.amount;
+    internalByCharacter.set(t.from, s);
+    const r = internalByCharacter.get(t.to) ?? { received: 0, sent: 0 };
+    r.received += t.amount;
+    internalByCharacter.set(t.to, r);
+  }
+  // Vista de un piloto: lo movido con tus otros pilotos cada día (para el gráfico; no está en el neto del día)
+  const internalDay = new Map<string, number>();
+  if (characterId) {
+    for (const x of transfers.values()) {
+      if (x.date < from) continue;
+      const d = isoDay(x.date);
+      const signed = (x.to === characterId ? x.amount : 0) - (x.from === characterId ? x.amount : 0);
+      if (signed) internalDay.set(d, (internalDay.get(d) ?? 0) + signed);
+    }
+  }
+
+  const byCharacter = await db
+    .select({ characterId: walletJournal.characterId, income, expenses })
+    .from(walletJournal)
+    .where(allPilots)
+    .groupBy(walletJournal.characterId);
+  const refType = refKind;
+  const byRefType = await db
+    .select({ refType, activity, income, expenses, count: sql<number>`count(*)` })
+    .from(walletJournal)
+    .where(inPeriod)
+    // La misma comisión de contrato puede ser logística (courier) o trading (compraventa)
+    .groupBy(refType, activity);
+
+  // «PvP con naves» (decisión del usuario): reponer una nave perdida y llevarla cuesta PvP, no trading ni
+  // logística. Las compras de reposición (emparejadas por shipLosses, también las de pérdidas de los 7 días
+  // previos al período) salen del asiento del journal de cada compra (market_escrow para el comprador;
+  // market_transaction en datos antiguos), y los movimientos de los couriers que llevaron naves perdidas
+  // (recompensa y comisión, con el contrato como context_id) salen de logística
+  const shipFlow = await shipLosses(days + REPLACEMENT_DAYS);
+  const replacementSpend = shipFlow.spend.filter((s) => s.date >= from && (!characterId || s.characterId === characterId));
+  // El asiento de una compra es el del journal del mismo piloto (el id puede repetirse en el del vendedor)
+  const refIds = [...new Set(replacementSpend.map((s) => s.journalRefId).filter((id): id is number => id !== null))];
+  const refOf = new Map(
+    (refIds.length
+      ? await db
+          .select({ id: walletJournal.journalId, characterId: walletJournal.characterId, amount: walletJournal.amount, refType, activity })
+          .from(walletJournal)
+          .where(and(inPeriod, inArray(walletJournal.journalId, refIds)))
+      : []
+    ).map((r) => [`${r.id}|${r.characterId}`, r]),
+  );
+  // Lo que sale de cada fila (ref_type + actividad). Una compra repartida entre dos pérdidas es un solo movimiento,
+  // y una que repone solo en parte (dos Rifter, uno para la pérdida) se queda en su fila con lo que no es reposición:
+  // el contador de la fila solo pierde los asientos que se van enteros a PvP
+  const used = new Map<string, number>();
+  const fromRows = new Map<string, { amount: number; ids: Set<string>; whole: number }>();
+  for (const s of replacementSpend) {
+    const id = `${s.journalRefId}|${s.characterId}`;
+    const r = s.journalRefId !== null ? refOf.get(id) : undefined;
+    if (!r) continue;
+    const key = `${r.refType}|${r.activity}`;
+    const row = fromRows.get(key) ?? { amount: 0, ids: new Set<string>(), whole: 0 };
+    row.amount += s.amount;
+    row.ids.add(id);
+    fromRows.set(key, row);
+    used.set(id, (used.get(id) ?? 0) + s.amount);
+  }
+  for (const [id, amount] of used) {
+    const r = refOf.get(id)!;
+    if (amount >= Math.abs(r.amount) - 0.01) fromRows.get(`${r.refType}|${r.activity}`)!.whole += 1;
+  }
+  const replacementTotal = [...fromRows.values()].reduce((n, r) => n + r.amount, 0);
+  const replacementCount = [...fromRows.values()].reduce((n, r) => n + r.ids.size, 0);
+  const transportRows = shipFlow.shipCouriers.length
+    ? await db
+        .select({ refType, activity, income, expenses, count: sql<number>`count(*)` })
+        .from(walletJournal)
+        .where(and(inPeriod, eq(walletJournal.contextIdType, 'contract_id'), inArray(walletJournal.contextId, shipFlow.shipCouriers)))
+        .groupBy(refType, activity)
+    : [];
+  const moved = {
+    replacement: replacementTotal,
+    replacementCount,
+    transport: withNet({
+      income: transportRows.reduce((n, r) => n + r.income, 0),
+      expenses: transportRows.reduce((n, r) => n + r.expenses, 0),
+    }),
+    transportCount: transportRows.reduce((n, r) => n + r.count, 0),
+  };
+  const shift = (a: string, r: { refType: string; activity: string; income: number; expenses: number; count: number }) => {
+    let { income: inc, expenses: exp, count } = r;
+    const repl = fromRows.get(`${r.refType}|${r.activity}`);
+    if (repl && r.activity === a) {
+      exp -= repl.amount;
+      count -= repl.whole;
+    }
+    const t = transportRows.find((x) => x.refType === r.refType && x.activity === r.activity);
+    if (t && r.activity === a) {
+      inc -= t.income;
+      exp -= t.expenses;
+      count -= t.count;
+    }
+    return { refType: r.refType, income: inc, expenses: exp, count };
+  };
+  const shipRefTypes = [
+    { refType: 'ship_replacement', income: 0, expenses: moved.replacement, count: moved.replacementCount },
+    { refType: 'ship_transport', income: moved.transport.income, expenses: moved.transport.expenses, count: moved.transportCount },
+  ].filter((r) => r.count > 0);
+
+  const day = sql<string>`date(${walletJournal.date}, 'unixepoch')`;
+  const accountsDay = sql<number>`coalesce(sum(case when ${activity} = 'accounts' then ${walletJournal.amount} end), 0)`;
+  const dailyRows = await db.select({ day, income, expenses, accounts: accountsDay }).from(walletJournal).where(inPeriod).groupBy(day);
+
+  // Serie diaria completa, con ceros en los días sin movimientos
+  const dailyMap = new Map(dailyRows.map((r) => [r.day, r]));
+  const daily = Array.from({ length: days }, (_, i) => {
+    const d = isoDay(new Date(from.getTime() + i * DAY_MS));
+    // accounts: PLEX comprado (−) o vendido (+) ese día, ya incluido en ingresos/gastos: el gráfico lo señala
+    const row = withNet({ date: d, income: dailyMap.get(d)?.income ?? 0, expenses: dailyMap.get(d)?.expenses ?? 0, accounts: dailyMap.get(d)?.accounts ?? 0 });
+    // internal: en la vista de un piloto, lo movido con tus otros pilotos ese día (aparte del neto)
+    return { ...row, internal: internalDay.get(d) ?? 0 };
+  });
+
+  // Saldo = el balance del último movimiento sincronizado de cada personaje
+  const chars = await db.select({ id: characters.id, name: characters.name, lastSyncAt: characters.lastSyncAt }).from(characters);
+  const charMap = new Map(byCharacter.map((r) => [r.characterId, r]));
+  const perCharacter = await Promise.all(
+    chars.map(async (c) => {
+      const last = await lastBalance(c.id);
+      const opening = await openingBalance(c.id, from);
+      const agg = charMap.get(c.id);
+      const internalReceived = internalByCharacter.get(c.id)?.received ?? 0;
+      const internalSent = internalByCharacter.get(c.id)?.sent ?? 0;
+      const income = agg?.income ?? 0;
+      const expenses = agg?.expenses ?? 0;
+      return {
+        id: c.id,
+        name: c.name,
+        lastSyncAt: c.lastSyncAt,
+        balance: last?.balance ?? null,
+        balanceAt: last?.date ?? null,
+        openingBalance: opening.balance,
+        openingAt: opening.at,
+        openingPartial: opening.partial,
+        income,
+        expenses,
+        internalReceived,
+        internalSent,
+        // El neto de un piloto es lo ganado en juego (decisión del usuario): la suma de los pilotos es el consolidado.
+        // Lo que cambió su wallet suma además lo movido con tus otros pilotos (saldo anterior + walletChange = saldo)
+        net: income - expenses,
+        walletChange: income - expenses + internalReceived - internalSent,
+      };
+    }),
+  );
+  perCharacter.sort((a, b) => (b.balance ?? 0) - (a.balance ?? 0));
+
+  return {
+    period: { days, from, to: now },
+    totals: totals as Totals,
+    characterId: characterId ?? null,
+    balance: perCharacter.filter((c) => !characterId || c.id === characterId).reduce((n, c) => n + (c.balance ?? 0), 0),
+    internalTransfers: Math.max(internal.received, internal.sent),
+    internalReceived: internal.received,
+    internalSent: internal.sent,
+    characters: perCharacter,
+    // Por actividad, con brutos y detalle por ref_type; el neto del trading es su margen
+    // Las compras de reposición y los couriers de naves perdidas ya están movidos a PvP (ship_replacement,
+    // ship_transport); los brutos de cada actividad son la suma de sus ref_types
+    byActivity: ACTIVITIES.map((a) => {
+      const refTypes = [
+        ...byRefType.filter((r) => r.activity === a).map((r) => shift(a, r)),
+        ...(a === 'pvp' ? shipRefTypes : []),
+      ]
+        // Sin redondeo: una fila que queda en 0 (todas sus compras eran reposición) desaparece; mientras le quede
+        // dinero se queda, para que la suma de las actividades sea siempre el total
+        .filter((r) => Math.abs(r.income) > 0.005 || Math.abs(r.expenses) > 0.005)
+        .map((r) => ({ ...r, count: Math.max(r.count, 1) }))
+        .map(withNet)
+        .sort((x, y) => Math.abs(y.net) - Math.abs(x.net));
+      return withNet({
+        activity: a,
+        income: refTypes.reduce((n, r) => n + r.income, 0),
+        expenses: refTypes.reduce((n, r) => n + r.expenses, 0),
+        count: refTypes.reduce((n, r) => n + r.count, 0),
+        refTypes,
+      });
+    }).filter((a) => a.count > 0),
+    // Lo movido a PvP por «PvP con naves» (para las notas de la web)
+    shipFlow: { replacement: moved.replacement, transport: moved.transport.expenses - moved.transport.income },
+    daily,
+    today,
+    previous: { ...previous, complete: previousComplete },
+    coverage: { firstEntryAt, coveredDays },
+    market: await marketReview(from, characterId),
+    // PLEX / cuentas: aparte del resultado de juego (el neto de la actividad está en byActivity)
+    accounts: await plexTraded(from, characterId),
+  };
+}

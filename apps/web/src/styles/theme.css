@@ -1,0 +1,926 @@
+/* EVE Ledger — tema HUD oscuro */
+:root {
+  color-scheme: dark;
+
+  /* Superficies */
+  --bg: #070c13;
+  --panel: #0f1822;
+  --panel-2: #0b131c;
+  --surface: var(--panel); /* alias usado por los componentes */
+  --surface-raised: #13212d;
+  --line: #1f2d3a;
+  --line-strong: #2d4556;
+  --corner: #4d7185;
+
+  /* Tinta */
+  --text: #e6eef5;
+  --text-primary: var(--text);
+  --text-secondary: #9fb3c2;
+  --text-muted: #7890a2;
+  --grid: #1b2833;
+  --axis: #2e4252;
+  --border: #22313e;
+  --hover: #61cce50d;
+
+  /* Acentos de interfaz (no de datos) */
+  --cyan: #61cce5;
+  --cyan-dim: #3b7f94;
+  --positive: #8ed7bc;
+  --critical: #f0857a;
+  --warning: #e7b75f; /* estado: datos viejos, sync desactivado */
+  --accent: var(--cyan);
+
+  /* Colores de datos: validados contra --panel (dark, all-pairs) */
+  --income: #2a98c0;
+  --expenses: #e8604c;
+  --inventory: #9a7cf0;
+  --balance: #6b8799; /* neutro para el saldo junto al inventario */
+
+  /* Tipografía */
+  --font: 'Inter Variable', 'Segoe UI', system-ui, sans-serif;
+  --mono: 'IBM Plex Mono', ui-monospace, Consolas, monospace;
+  --display: 'Barlow Condensed', 'Arial Narrow', sans-serif;
+
+  --radius: 10px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--bg);
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--text);
+  font: 14px/1.5 var(--font);
+  font-synthesis: none;
+  background:
+    radial-gradient(ellipse 70% 40% at 50% -5%, #13304680, transparent 70%),
+    radial-gradient(ellipse 40% 30% at 100% 0%, #2a1f4a33, transparent 70%),
+    var(--bg);
+}
+
+::selection {
+  background: #61cce540;
+  color: #fff;
+}
+
+html {
+  scrollbar-color: #2d4556 transparent;
+  accent-color: var(--cyan);
+  caret-color: var(--cyan);
+}
+
+a {
+  color: var(--cyan);
+  text-underline-offset: 3px;
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+button,
+a {
+  transition:
+    background 0.18s,
+    color 0.18s,
+    border-color 0.18s,
+    box-shadow 0.18s;
+}
+
+:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 3px;
+}
+
+.shell {
+  width: calc(100% - 64px);
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.icon {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* ───── Barra superior ───── */
+.utility {
+  height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid #ffffff08;
+}
+.micro-brand {
+  display: flex;
+  align-items: center;
+}
+.brand-square {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--cyan-dim);
+  border-radius: 4px;
+  color: var(--cyan);
+  font: 700 15px var(--display);
+  letter-spacing: 0;
+}
+.utility-right {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+/* Con cinco secciones, la cabecera ya no cabe en una fila por debajo de ~1280 px (en español, el estado del sync y
+   Sincronizar se salían por la derecha): las secciones bajan a una segunda fila, como en móvil */
+@media (max-width: 1279px) {
+  .utility {
+    height: auto;
+    min-height: 52px;
+    padding: 6px 0 0;
+    flex-wrap: wrap;
+  }
+  .utility-right {
+    margin-left: auto;
+  }
+}
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #8dacc0;
+  white-space: nowrap;
+}
+.status-badge .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--positive);
+}
+.status-badge.off {
+  color: var(--warning);
+}
+.status-badge.off .dot {
+  background: var(--warning);
+}
+.status-badge.busy .dot {
+  background: var(--cyan);
+  animation: pulse 0.9s ease-in-out infinite;
+}
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* Oculto hasta recibir el foco con Tab: primera parada de la página */
+.skip-link {
+  position: absolute;
+  top: 8px;
+  left: 16px;
+  z-index: 10;
+  padding: 8px 14px;
+  border-radius: 6px;
+  background: var(--panel);
+  border: 1px solid var(--cyan);
+  color: var(--text);
+  font-size: 14px;
+  transform: translateY(-200%);
+}
+.skip-link:focus {
+  transform: none;
+}
+.skip-target {
+  height: 0;
+  scroll-margin-top: 12px;
+}
+.skip-target:focus {
+  outline: none;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* ───── Botones ───── */
+/* Acciones en línea (Sincronizar, Revincular, Revisar): enlace o botón, se ven igual en todas las páginas */
+.inline-action {
+  /* Zona táctil ampliada (40 px) sin mover el texto */
+  padding: 12px 0;
+  margin-block: -12px;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-weight: 550;
+  color: var(--cyan);
+  text-decoration: none;
+  cursor: pointer;
+}
+.inline-action:hover {
+  text-decoration: underline;
+}
+.inline-action:disabled {
+  color: var(--text-muted);
+  cursor: progress;
+}
+.sync-form.inline {
+  display: inline;
+}
+/* Botón principal en contorno: la acción está a mano, pero lo más luminoso de la pantalla es el dato */
+.primary-button.outline {
+  background: #61cce514;
+  border-color: var(--cyan-dim);
+  color: #8addee;
+}
+.primary-button.outline:hover {
+  background: #61cce526;
+  border-color: var(--cyan);
+  box-shadow: none;
+}
+.primary-button.outline:disabled {
+  background: #61cce514;
+  border-color: var(--cyan-dim);
+  color: var(--text-muted);
+}
+.primary-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #75d8ed;
+  background: #60c8e0;
+  color: #06202b;
+  padding: 8px 14px;
+  border-radius: 5px;
+  font-size: 13px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+.primary-button:hover {
+  background: #82d9e9;
+  box-shadow: 0 6px 18px -8px #61cce599;
+}
+.primary-button:disabled {
+  cursor: progress;
+  background: #3e8a9c;
+  border-color: #4f9fb2;
+  color: #e6f7fb;
+}
+.primary-button[aria-busy='true'] .icon {
+  animation: spin 1s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.secondary-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 13px;
+  border: 1px solid #365164;
+  border-radius: 5px;
+  background: #14232f;
+  color: #a4c5d9;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.secondary-button:hover {
+  background: #203748;
+  text-decoration: none;
+}
+
+/* ───── Franja de marca con mapa estelar (compacta) ───── */
+.hero {
+  position: relative;
+  height: 118px;
+  isolation: isolate;
+  overflow: hidden;
+}
+.hero-lockup {
+  height: 100%;
+  display: flex;
+  align-items: center;
+}
+.hero-name {
+  margin: 0;
+  font: 700 46px/1 var(--display);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--text);
+}
+.hero-name span {
+  font-weight: 500;
+  color: #c9d8e4;
+}
+.hero-name i {
+  font-style: normal;
+  color: var(--cyan);
+  margin-left: 2px;
+}
+.hero-tagline {
+  margin-top: 6px;
+  font-size: 13px;
+  letter-spacing: 0.03em;
+  color: #7690a1;
+}
+
+/* ───── Navegación de período ───── */
+.period-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px 16px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.period-meta .fresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+}
+.period-meta .fresh .icon {
+  width: 14px;
+  height: 14px;
+}
+.main-nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  height: 56px;
+  border-top: 1px solid #ffffff06;
+  border-bottom: 1px solid var(--line);
+}
+.nav-tabs {
+  display: flex;
+  gap: 6px;
+  height: 100%;
+  align-items: center;
+}
+.nav-tab {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 15px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: #93a6b7;
+  font-size: 13px;
+  font-weight: 550;
+}
+.nav-tab:hover {
+  color: var(--text);
+  background: #ffffff05;
+  text-decoration: none;
+}
+.nav-tab[aria-current] {
+  background: #16304070;
+  color: #8addee;
+  border-color: #30506480;
+}
+.nav-tab[aria-current]::after {
+  content: '';
+  position: absolute;
+  bottom: -11px;
+  left: 18px;
+  right: 18px;
+  height: 2px;
+  background: var(--cyan);
+}
+
+main {
+  display: grid;
+  gap: 20px;
+  padding: 20px 0 8px;
+}
+
+/* ───── Paneles con esquinas de mira ───── */
+.panel {
+  position: relative;
+  min-width: 0;
+  background: linear-gradient(135deg, #111c27, #0d1620 70%);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.panel::before,
+.panel::after {
+  content: '';
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  pointer-events: none;
+}
+.panel::before {
+  top: -1px;
+  left: -1px;
+  border-top: 1px solid var(--corner);
+  border-left: 1px solid var(--corner);
+  border-top-left-radius: var(--radius);
+}
+.panel::after {
+  bottom: -1px;
+  right: -1px;
+  border-bottom: 1px solid var(--corner);
+  border-right: 1px solid var(--corner);
+  border-bottom-right-radius: var(--radius);
+}
+.panel-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 58px;
+  padding: 16px 22px;
+  border-bottom: 1px solid #26313b88;
+}
+.panel-heading h2 {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 15px;
+  font-weight: 600;
+}
+.panel-heading .meta {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+.panel-body {
+  padding: 20px 22px;
+}
+.panel-note {
+  padding: 12px 22px 16px;
+  border-top: 1px solid #26313b88;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+/* Repartos (tortas) en los paneles: una fila de figuras, cada una con su torta y su pie (o su tabla-leyenda al lado) */
+.shares {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20px 56px;
+}
+.shares figure {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  gap: 12px 20px;
+  align-items: center;
+  flex: 1 1 360px;
+  margin: 0;
+  min-width: 0;
+}
+.shares figure.caption-only {
+  grid-template-columns: 120px;
+  justify-items: center;
+  flex: 0 0 auto;
+}
+.shares figcaption {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.shares figure.caption-only figcaption {
+  text-align: center;
+}
+.shares .mini {
+  align-self: start;
+}
+/* La muestra de color pegada al nombre (en .who el hueco ya lo pone el gap) */
+.who .swatch {
+  margin-right: 0;
+}
+@media (max-width: 600px) {
+  .shares {
+    gap: 20px 32px;
+  }
+  .shares figure {
+    grid-template-columns: 1fr;
+    justify-items: center;
+  }
+  .shares figure .donut {
+    width: 140px;
+  }
+  .shares figure.caption-only .donut {
+    width: 120px;
+  }
+  .shares .mini {
+    width: 100%;
+  }
+}
+/* Tablas cortas junto a una torta: etiqueta a la izquierda, cifras a la derecha; la muestra de color es la leyenda */
+.mini {
+  width: 100%;
+  border-collapse: collapse;
+}
+.mini th,
+.mini td {
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+  text-align: right;
+}
+.mini th:first-child {
+  text-align: left;
+}
+.mini th:not(:first-child),
+.mini td {
+  padding-left: 12px;
+}
+/* Las cabeceras se parten (th lleva nowrap): si no, ensanchaban la tarjeta en móvil */
+.mini thead th {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: normal;
+  vertical-align: bottom;
+}
+.mini tbody th {
+  font-weight: 500;
+  color: var(--text);
+  text-transform: none;
+  letter-spacing: 0;
+  white-space: normal;
+}
+.mini td {
+  font-family: var(--mono);
+  color: var(--text);
+  white-space: nowrap;
+}
+.mini tbody tr:last-child > * {
+  border-bottom: 0;
+}
+@media (max-width: 480px) {
+  /* Las tablas cortas no se encogen por debajo de su contenido: en 390 px «1.791.399 veces» se parte en dos líneas */
+  .mini td {
+    white-space: normal;
+  }
+}
+/* Cabecera de columna que ordena la tabla (botón sin aspecto de botón; la flecha, en el relleno de la celda para no
+   ensanchar la columna, dice el orden) */
+.sort-button {
+  position: relative;
+  display: inline-block;
+  margin: -6px -8px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+.sort-button:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+.sort-button::after {
+  content: '';
+  position: absolute;
+  right: -4px;
+  top: 50%;
+  width: 0.9em;
+  height: 0.9em;
+  translate: 0 -50%;
+  opacity: 0;
+  background: currentColor;
+  mask: center / contain no-repeat url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 3l4 5H4z'/%3E%3C/svg%3E");
+}
+th[aria-sort='ascending'] .sort-button,
+th[aria-sort='descending'] .sort-button {
+  color: var(--text);
+}
+th[aria-sort='ascending'] .sort-button::after {
+  opacity: 1;
+}
+th[aria-sort='descending'] .sort-button::after {
+  opacity: 1;
+  transform: rotate(180deg);
+}
+/* Selector de orden (móvil, donde la tabla son tarjetas sin cabecera) */
+.sort-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.sort-select select {
+  min-height: 40px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--panel-2, #0f1a25);
+  color: var(--text);
+  font: 13px var(--font);
+}
+
+/* Aviso / mensajes */
+.notice {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 14px 18px;
+  border: 1px solid #34566b;
+  border-radius: 7px;
+  background: #14273688;
+  color: #a6c8db;
+  font-size: 13px;
+}
+.notice .icon {
+  margin-top: 2px;
+  color: var(--cyan);
+}
+.notice.error {
+  border-color: #663b44;
+  background: #281a21;
+  color: #dfa5ad;
+}
+.notice.error .icon {
+  color: var(--critical);
+}
+.notice.warning {
+  border-color: #6b5530;
+  background: #2a2216;
+  color: #e9d3a8;
+}
+.notice.warning .icon {
+  color: var(--warning);
+}
+.notice a {
+  color: inherit;
+  text-decoration: underline;
+}
+
+/* ───── KPIs ───── */
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 18px 20px;
+}
+.stat .label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+.stat .label .icon {
+  width: 14px;
+  height: 14px;
+  color: var(--cyan-dim);
+}
+.stat .value {
+  font: 500 28px/1.15 var(--mono);
+  letter-spacing: -0.04em;
+  color: #cfe3ee;
+  white-space: nowrap;
+}
+.stat .value small {
+  font: 400 13px var(--mono);
+  color: #6b9caf;
+  margin-left: 6px;
+}
+.stat .sub {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+/* KPI principal: borde cian y línea de luz superior */
+.stat.hero-stat {
+  border-color: #345469;
+  background: linear-gradient(150deg, #13283875, #0f1924 55%);
+}
+.stat.hero-stat::before,
+.stat.hero-stat::after {
+  border-color: var(--cyan-dim);
+}
+.hero-stat .value {
+  font-size: 44px;
+}
+
+/* ───── Rejillas ───── */
+.split {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+  align-items: stretch;
+}
+
+/* ───── Tablas ───── */
+.scroll {
+  overflow-x: auto;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+th,
+td {
+  padding: 10px 12px;
+  text-align: right;
+  vertical-align: middle;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--line);
+}
+th {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #8ba4b5;
+  border-bottom-color: var(--line-strong);
+}
+td {
+  font: 13px var(--mono);
+  color: #c0d4e1;
+}
+th:first-child,
+td:first-child {
+  text-align: left;
+}
+td:first-child {
+  font-family: var(--font);
+  color: var(--text);
+}
+tbody tr:last-child td {
+  border-bottom: none;
+}
+tbody tr:hover td {
+  background: #61cce508;
+}
+td.pos {
+  color: var(--positive);
+}
+td.neg {
+  color: var(--critical);
+}
+
+.who {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.who img {
+  border-radius: 4px;
+  border: 1px solid var(--line-strong);
+}
+
+/* ───── Pie ───── */
+/* footer.shell: la clase .shell pone margin: 0 auto y, sin este selector, anulaba el margen superior */
+footer.shell {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px 20px;
+  margin-top: 40px;
+  padding: 20px 0 28px;
+  border-top: 1px solid #1f2d38;
+  font-size: 12px;
+  color: #6f8a9c;
+}
+footer.shell span {
+  text-wrap: balance;
+}
+footer .footer-brand {
+  font: 500 12px var(--mono);
+  letter-spacing: 0.04em;
+  color: #a3baca;
+}
+footer .footer-version {
+  color: #6f8a9c;
+}
+
+/* ───── Responsive ───── */
+@media (max-width: 1040px) {
+  .shell {
+    width: calc(100% - 40px);
+  }
+}
+@media (max-width: 750px) {
+  .shell {
+    width: calc(100% - 32px);
+  }
+  .split {
+    grid-template-columns: 1fr;
+  }
+  .hero {
+    height: 92px;
+  }
+  .hero-name {
+    font-size: 32px;
+  }
+  .hero-tagline {
+    font-size: 12px;
+  }
+  .main-nav {
+    height: auto;
+    padding: 10px 0;
+    flex-wrap: wrap;
+  }
+  .nav-tab {
+    min-height: 40px;
+    padding: 7px 12px;
+    font-size: 12px;
+  }
+  .nav-tab[aria-current]::after {
+    display: none;
+  }
+  .utility {
+    height: auto;
+    min-height: 52px;
+    padding: 8px 0;
+    flex-wrap: wrap;
+  }
+  /* Marca, idioma, estado y Sincronizar en una sola fila; las secciones bajan a la segunda */
+  .utility-right {
+    flex-wrap: nowrap;
+    justify-content: flex-end;
+    margin-left: auto;
+    gap: 8px;
+  }
+  /* En móvil solo el punto (ámbar si el sync automático está desactivado); el texto sigue para lectores de pantalla */
+  .status-badge .text {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+  .sync-form .primary-button {
+    min-height: 40px;
+    padding-inline: 14px;
+  }
+  .period-meta {
+    justify-content: flex-start;
+    width: 100%;
+  }
+  .stat {
+    padding: 14px 16px;
+  }
+  .stat .value {
+    font-size: 22px;
+  }
+  .hero-stat .value {
+    font-size: 36px;
+  }
+  .panel-heading,
+  .panel-body {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}

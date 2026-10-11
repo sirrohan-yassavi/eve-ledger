@@ -1,0 +1,387 @@
+---
+// Marco común de las páginas: barra superior (marca, secciones, estado del sync, botón), pie y scripts
+import { APP_VERSION } from 'astro:env/server';
+import '@fontsource-variable/inter';
+import '@fontsource/ibm-plex-mono/400.css';
+import '@fontsource/ibm-plex-mono/500.css';
+import '@fontsource/barlow-condensed/500.css';
+import '@fontsource/barlow-condensed/700.css';
+import '../styles/theme.css';
+import Icon from '../components/Icon.astro';
+import StarMap from '../components/StarMap.astro';
+import type { SyncStatus } from '../lib/api';
+import { ago, until } from '../lib/format';
+import { LANG_NAMES, LANGS, getLang, t } from '../lib/i18n';
+
+interface Props {
+  title?: string;
+  section: 'resumen' | 'indicadores' | 'balances' | 'doctrinas' | 'pilotos';
+  status?: SyncStatus;
+  pilots?: number;
+  // Pilotos con el sync roto, viejo o sin primer sync: un punto ámbar junto a «Pilotos»
+  pilotIssues?: number;
+}
+const { title, section, status, pilots, pilotIssues } = Astro.props;
+const lang = getLang(Astro);
+const m = t(lang);
+
+// Tras sincronizar se vuelve a la misma página (sin los parámetros de un aviso anterior)
+const back = new URL(Astro.url);
+for (const k of ['synced', 'syncErrors', 'syncFailed', 'linked', 'error', 'detail']) back.searchParams.delete(k);
+const backPath = back.pathname + back.search;
+
+const cron = !status
+  ? undefined
+  : !status.enabled
+    ? { cls: 'off', text: m.cronOff, short: m.cronOffShort }
+    : status.running
+      ? { cls: 'busy', text: m.syncing }
+      : {
+          cls: '',
+          text: m.cronEvery(status.intervalMin) + (status.nextRunAt ? m.cronNext(until(status.nextRunAt, lang)) : ''),
+        };
+const cronTitle = status?.lastRun
+  ? m.cronLast(ago(status.lastRun.finishedAt, lang), status.lastRun.inserted) +
+    (status.lastRun.errors ? m.cronLastErrors(status.lastRun.errors) : '')
+  : undefined;
+const langHref = (to: string) => `/lang?${new URLSearchParams({ to, back: backPath })}`;
+---
+
+<!doctype html>
+<html lang={lang}>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#070c13" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/favicon.ico" sizes="48x48" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <title>{title ? `${title} · EVE Ledger` : 'EVE Ledger'}</title>
+  </head>
+  <body data-last-run={status?.lastRun?.finishedAt ?? ''} data-now={m.now} data-syncing={m.syncing}>
+    <a class="skip-link" href="#contenido">{m.skipToContent}</a>
+    <header class="utility shell">
+      <a class="micro-brand" href="/" aria-label="EVE Ledger">
+        <span class="brand-square" aria-hidden="true">E</span>
+      </a>
+      <nav class="sections" aria-label={m.sections}>
+        <a href="/" aria-current={section === 'resumen' ? 'page' : undefined}>{m.summary}</a>
+        <a href="/indicadores" aria-current={section === 'indicadores' ? 'page' : undefined}>{m.indicators}</a>
+        <a href="/balances" aria-current={section === 'balances' ? 'page' : undefined}>{m.balances}</a>
+        <a href="/doctrinas" aria-current={section === 'doctrinas' ? 'page' : undefined}>{m.doctrines}</a>
+        <a
+          href="/pilotos"
+          aria-current={section === 'pilotos' ? 'page' : undefined}
+          aria-label={pilots !== undefined ? m.pilotsNav(pilots, pilotIssues ?? 0) : undefined}
+          title={pilotIssues ? m.pilotIssues(pilotIssues) : undefined}
+        >
+          {/* El punto ámbar va pegado a la palabra, como marca de aviso: junto al contador se leía «4 problemas» */}
+          <span class="nav-label">
+            {m.pilots}
+            {!!pilotIssues && <i class="issue-dot" aria-hidden="true" />}
+          </span>
+          {pilots !== undefined && <span class="count">{pilots}</span>}
+        </a>
+      </nav>
+      <div class="utility-right">
+        <nav class="lang-switch" aria-label={m.language}>
+          {
+            LANGS.map((l) => (
+              <a href={langHref(l)} hreflang={l} lang={l} title={LANG_NAMES[l]} aria-current={l === lang ? 'true' : undefined}>
+                {l.toUpperCase()}
+              </a>
+            ))
+          }
+        </nav>
+        {
+          cron && (
+            <span class:list={['status-badge', cron.cls]} title={cronTitle}>
+              <i class="dot" />
+              <span class="text">{cron.text}</span>
+              {'short' in cron && <span class="text-short" aria-hidden="true">{cron.short}</span>}
+            </span>
+          )
+        }
+        {
+          // Sin pilotos no hay nada que sincronizar: la única acción es vincular el primero
+          pilots !== 0 && (
+            <form method="post" action="/sync" class="sync-form">
+              <input type="hidden" name="back" value={backPath} />
+              <button type="submit" class="primary-button outline" title={m.syncAllTitle}>
+                <Icon name="refresh" />
+                <span class="label">{m.syncAll}</span>
+              </button>
+            </form>
+          )
+        }
+      </div>
+    </header>
+
+    <!-- Franja de marca: mapa estelar animado detrás del título (decorativa) -->
+    <section class="hero" aria-label="EVE Ledger">
+      <StarMap />
+      <div class="hero-lockup shell">
+        <div class="hero-title">
+          <p class="hero-name" aria-hidden="true">EVE <span>Ledger</span><i>_</i></p>
+          <p class="hero-tagline">{m.heroTagline}</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Destino de «Saltar al contenido»: antes de las pestañas de período, que son controles del contenido -->
+    <div id="contenido" class="skip-target" tabindex="-1"></div>
+    <slot name="nav" />
+
+    <!-- Aviso de datos nuevos: sustituye a la recarga cuando el usuario está leyendo (detalles abiertos o scroll) -->
+    <div class="update-notice" role="status" hidden>
+      <span>{m.newData}</span>
+      <button type="button">{m.refreshNow}</button>
+    </div>
+
+    <main class="shell">
+      <slot />
+    </main>
+
+    <footer class="shell">
+      <span class="footer-brand">EVE LEDGER · localhost{APP_VERSION && <span class="footer-version"> · v{APP_VERSION}</span>}</span>
+      <span>{m.footer}</span>
+    </footer>
+  </body>
+</html>
+
+<script>
+  // Tiempos relativos vivos: la página puede quedarse horas abierta en el segundo monitor
+  const rtf = new Intl.RelativeTimeFormat(document.documentElement.lang, { numeric: 'always', style: 'short' });
+  const ago = (iso: string) => {
+    const min = (Date.now() - new Date(iso).getTime()) / 60_000;
+    if (min < 1) return document.body.dataset.now ?? '';
+    if (min < 60) return rtf.format(-Math.round(min), 'minute');
+    const h = min / 60;
+    return h < 48 ? rtf.format(-Math.round(h), 'hour') : rtf.format(-Math.round(h / 24), 'day');
+  };
+  const tick = () => {
+    for (const el of document.querySelectorAll<HTMLElement>('[data-ago]')) el.textContent = ago(el.dataset.ago!);
+  };
+  setInterval(tick, 30_000);
+
+  // Auto-refresco: cuando termina un sync automático nuevo se recargan los datos, pero solo si la
+  // recarga no tira la lectura (arriba del todo y sin detalles abiertos); si no, un aviso lo ofrece
+  const lastRunAt = document.body.dataset.lastRun || null;
+  const notice = document.querySelector<HTMLElement>('.update-notice')!;
+  notice.querySelector('button')!.addEventListener('click', () => location.reload());
+  let fresh = false;
+  const safeToReload = () => scrollY < 80 && !document.querySelector('details[open]');
+  setInterval(async () => {
+    if (document.hidden) return;
+    try {
+      const res = await fetch('/status.json', { cache: 'no-store' });
+      if (!res.ok) return;
+      const s = (await res.json()) as { running: boolean; lastRunAt: string | null };
+      if (!s.running && s.lastRunAt && s.lastRunAt !== lastRunAt) fresh = true;
+      if (fresh) {
+        if (safeToReload()) location.reload();
+        else notice.hidden = false;
+      }
+    } catch {
+      // API caída: se reintenta en el siguiente ciclo
+    }
+  }, 60_000);
+
+  // Estado de carga en cualquier formulario de sync: puede tardar; evita envíos dobles
+  for (const form of document.querySelectorAll<HTMLFormElement>('form.sync-form')) {
+    form.addEventListener('submit', () => {
+      const button = form.querySelector('button')!;
+      button.disabled = true;
+      button.setAttribute('aria-busy', 'true');
+      const label = button.querySelector('.label');
+      if (label) label.textContent = document.body.dataset.syncing ?? '';
+    });
+  }
+</script>
+
+<style>
+  .sections {
+    display: flex;
+    align-self: stretch;
+    gap: 4px;
+    margin-right: auto;
+    margin-left: 20px;
+  }
+  .sections a {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 0 12px;
+    font-size: 13px;
+    font-weight: 550;
+    color: #93a6b7;
+    text-decoration: none;
+  }
+  .sections a:hover {
+    color: var(--text);
+  }
+  .sections a[aria-current='page'] {
+    color: var(--text);
+  }
+  .sections a[aria-current='page']::after {
+    content: '';
+    position: absolute;
+    left: 12px;
+    right: 12px;
+    bottom: -1px;
+    height: 2px;
+    background: var(--cyan);
+  }
+  .lang-switch {
+    display: flex;
+    padding: 2px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+  }
+  .lang-switch a {
+    padding: 5px 9px;
+    border-radius: 4px;
+    font: 500 12px/1.4 var(--mono);
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    text-decoration: none;
+  }
+  .lang-switch a:hover {
+    color: var(--text);
+  }
+  .lang-switch a[aria-current='true'] {
+    background: #16304070;
+    color: #8addee;
+  }
+  .text-short {
+    display: none;
+  }
+  .update-notice {
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 10px 10px 10px 16px;
+    border: 1px solid var(--cyan-dim);
+    border-radius: 8px;
+    background: #0d1a25f2;
+    box-shadow: 0 10px 30px #0008;
+    font-size: 13px;
+    color: var(--text);
+  }
+  .update-notice[hidden] {
+    display: none;
+  }
+  .update-notice button {
+    min-height: 32px;
+    padding: 0 14px;
+    border: 1px solid var(--cyan-dim);
+    border-radius: 6px;
+    background: #16304070;
+    color: #8addee;
+    cursor: pointer;
+  }
+  .update-notice button:hover {
+    background: #1c3a4c;
+  }
+  .nav-label {
+    position: relative;
+  }
+  .issue-dot {
+    position: absolute;
+    top: -3px;
+    right: -8px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--warning);
+  }
+  .count {
+    min-width: 18px;
+    padding: 0 5px;
+    border-radius: 9px;
+    background: #1b2c3a;
+    font: 500 12px/18px var(--mono);
+    color: var(--text-secondary);
+    text-align: center;
+  }
+  @media (max-width: 1279px) {
+    .sections {
+      order: 3;
+      width: 100%;
+      margin: 0;
+      height: 44px;
+    }
+    .sections a:first-child {
+      padding-left: 0;
+    }
+    .sections a:first-child[aria-current='page']::after {
+      left: 0;
+    }
+  }
+  @media (max-width: 750px) {
+    .sections {
+      order: 3;
+      width: 100%;
+      margin: 0;
+      height: 40px;
+    }
+    /* Cinco secciones en 358 px: menos aire entre ellas y, si aun así no caben (alemán), la fila se desliza */
+    .sections {
+      gap: 0;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    .sections a {
+      flex-shrink: 0;
+      padding: 0 7px;
+    }
+    /* El contador de pilotos sobra aquí: lo dice el aria-label y la página; el punto ámbar se queda */
+    .sections .count {
+      display: none;
+    }
+    /* Con overflow, la raya de 1 px por debajo se recortaría */
+    .sections a[aria-current='page']::after {
+      left: 7px;
+      right: 7px;
+      bottom: 0;
+    }
+    .sections a:first-child {
+      padding-left: 0;
+    }
+    .sections a:first-child[aria-current='page']::after {
+      left: 0;
+    }
+    /* Sync automático desactivado: chip ámbar con texto corto (solo un punto era una señal solo de color);
+       para hacerle sitio, Sincronizar pasa a solo icono mientras dure el aviso */
+    .text-short {
+      display: inline;
+    }
+    .utility-right:has(.status-badge.off) .sync-form .label {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+      white-space: nowrap;
+    }
+    .utility-right:has(.status-badge.off) .sync-form .primary-button {
+      padding-inline: 12px;
+    }
+    /* Objetivos táctiles de 40 px: el selector de idioma medía 21 px de alto y la marca 26 */
+    .micro-brand {
+      margin-left: -7px;
+      padding: 7px;
+    }
+    .lang-switch a {
+      display: inline-flex;
+      align-items: center;
+      min-height: 40px;
+      padding: 0 12px;
+    }
+  }
+</style>

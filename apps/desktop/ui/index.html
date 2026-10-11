@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>EVE Ledger</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <!-- Asistente del primer arranque, configuración y arranque de los servicios: una sola página, tres vistas.
+         Los textos los pone app.js según el idioma del sistema (ES, EN o DE) -->
+    <header class="brand">
+      <img src="logo.svg" alt="" width="28" height="28" />
+      <span class="wordmark">EVE LEDGER<span class="cursor">_</span></span>
+      <span class="version" data-version></span>
+    </header>
+
+    <main>
+      <!-- Configuración (primer arranque y «Configuración…») -->
+      <form id="setup" class="view" hidden novalidate>
+        <h1 data-t="setupTitle"></h1>
+        <p class="lead" data-t="setupLead"></p>
+
+        <section class="panel">
+          <h2 data-t="prefsTitle"></h2>
+          <div class="grid">
+            <label>
+              <span data-t="pilotSlots"></span>
+              <input name="pilotSlots" type="number" min="1" max="50" inputmode="numeric" />
+              <small data-t="pilotSlotsHint"></small>
+            </label>
+            <label>
+              <span data-t="syncInterval"></span>
+              <input name="syncIntervalMin" type="number" min="0" max="1440" inputmode="numeric" />
+              <small data-t="syncIntervalHint"></small>
+            </label>
+            <label>
+              <span data-t="omegaAccounts"></span>
+              <input name="omegaAccounts" type="number" min="0" max="50" inputmode="numeric" />
+              <small data-t="omegaAccountsHint"></small>
+            </label>
+            <label>
+              <span data-t="omegaPlex"></span>
+              <input name="omegaPlexPerMonth" type="number" min="1" max="10000" inputmode="numeric" />
+              <small data-t="omegaPlexHint"></small>
+            </label>
+            <label class="wide">
+              <span data-t="esiContact"></span>
+              <input name="esiContact" autocomplete="off" spellcheck="false" />
+              <small data-t="esiContactHint"></small>
+            </label>
+          </div>
+        </section>
+
+        <!-- Segundo plano: ESI solo da ~30 días de wallet; si la app no está abierta, esos días se pierden -->
+        <section class="panel">
+          <h2 data-t="backgroundTitle"></h2>
+          <p class="hint" data-t="backgroundLead"></p>
+          <div class="checks">
+            <label class="check">
+              <input name="startAtLogin" type="checkbox" />
+              <span>
+                <span data-t="startAtLogin"></span>
+                <small data-t="startAtLoginHint"></small>
+              </span>
+            </label>
+            <label class="check">
+              <input name="closeToTray" type="checkbox" />
+              <span>
+                <span data-t="closeToTray"></span>
+                <small data-t="closeToTrayHint"></small>
+              </span>
+            </label>
+          </div>
+        </section>
+
+        <details class="panel advanced">
+          <summary data-t="advancedTitle"></summary>
+          <!-- El puerto de la API es fijo (47300): la app de EVE incluida solo conoce esa Callback URL -->
+          <div class="grid">
+            <label>
+              <span data-t="webPort"></span>
+              <input name="webPort" type="number" min="1024" max="65535" inputmode="numeric" />
+              <small data-t="webPortHint"></small>
+            </label>
+          </div>
+          <div class="enc">
+            <p><strong data-t="encTitle"></strong> <span data-t="encText"></span></p>
+            <input type="hidden" name="encKey" />
+            <button type="button" class="secondary" data-regenerate data-t="encRegenerate"></button>
+            <p class="hint warn" data-enc-changed hidden data-t="encChanged"></p>
+          </div>
+          <dl class="paths">
+            <dt data-t="configFile"></dt><dd><code data-path="configPath"></code></dd>
+            <dt data-t="dataDir"></dt><dd><code data-path="dataDir"></code> <button type="button" class="link" data-dir="data" data-t="open"></button></dd>
+            <dt data-t="logDir"></dt><dd><code data-path="logDir"></code> <button type="button" class="link" data-dir="logs" data-t="open"></button></dd>
+          </dl>
+        </details>
+
+        <div class="errors" role="alert" data-errors hidden></div>
+        <div class="actions">
+          <button type="submit" class="primary" data-save></button>
+          <button type="button" class="secondary" data-cancel hidden data-t="cancel"></button>
+        </div>
+      </form>
+
+      <!-- Arrancando los servicios / error al arrancar -->
+      <section id="starting" class="view" hidden aria-live="polite">
+        <h1 data-starting-title></h1>
+        <p class="lead" data-starting-text></p>
+        <pre class="log" data-starting-log hidden></pre>
+        <div class="actions" data-starting-actions hidden>
+          <button type="button" class="primary" data-retry data-t="retry"></button>
+          <button type="button" class="secondary" data-to-settings data-t="openSettings"></button>
+          <button type="button" class="secondary" data-dir="logs" data-t="openLogs"></button>
+        </div>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

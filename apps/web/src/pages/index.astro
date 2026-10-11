@@ -1,0 +1,2311 @@
+---
+import { PILOT_SLOTS } from 'astro:env/server';
+import Base from '../layouts/Base.astro';
+import FirstRun from '../components/FirstRun.astro';
+import FirstSync from '../components/FirstSync.astro';
+import DailyChart from '../components/DailyChart.astro';
+import Icon from '../components/Icon.astro';
+import NewEdenMap from '../components/NewEdenMap.astro';
+import MarketItems from '../components/MarketItems.astro';
+import MarketReview from '../components/MarketReview.astro';
+import ActivityList from '../components/ActivityList.astro';
+import BarList, { type BarRow } from '../components/BarList.astro';
+import CoverageNote from '../components/CoverageNote.astro';
+import ShipLosses from '../components/ShipLosses.astro';
+import Donut from '../components/Donut.astro';
+import { fold } from '../lib/shares';
+import {
+  ApiError,
+  getIndicators,
+  getInventory,
+  getLosses,
+  getMap,
+  getPilots,
+  getSummary,
+  getSyncStatus,
+  loginUrl,
+  syncLogUrl,
+  type GeoMap,
+  type Indicators,
+  type Inventory,
+  type Losses,
+  type Pilot,
+  type Summary,
+  type SyncStatus,
+} from '../lib/api';
+import { ago, isk, iskFull, longDate, refTypeLabel, shortDate } from '../lib/format';
+import { getLang, t } from '../lib/i18n';
+import { withInventory } from '../lib/inventory-pref';
+import { ASSETS_SCOPE, CONTRACTS_SCOPE, SKILLS_SCOPE, LOSSES_SCOPE, hasIssue, pilotState } from '../lib/pilot-state';
+
+const lang = getLang(Astro);
+const m = t(lang);
+const fmt = (v: number, o: { sign?: boolean } = {}) => isk(v, { ...o, lang });
+const full = (v: number) => iskFull(v, lang);
+// Netos completos con su signo (+), como la cifra abreviada
+const fullNet = (v: number) => iskFull(v, lang, true);
+const date = (iso: string) => shortDate(iso, lang);
+const rel = (iso: string | null) => ago(iso, lang);
+
+const PERIODS = [7, 30, 90];
+const q = Astro.url.searchParams;
+const days = PERIODS.includes(Number(q.get('days'))) ? Number(q.get('days')) : 30;
+// ?pilot=ID: el ledger de un solo piloto
+const pilotParam = Number(q.get('pilot'));
+const pilotId = Number.isSafeInteger(pilotParam) && pilotParam > 0 ? pilotParam : undefined;
+// Patrimonio solo con los wallets (por defecto) o + inventario: la elección vive en una cookie (/inv);
+// ?inv=1 / ?inv=0 en la URL manda para esa vista y los enlaces lo conservan
+const invPref = withInventory(Astro);
+const withInv = invPref.on;
+const href = (d: number, pilot?: number, keepInv = true) =>
+  `/?days=${d}${pilot ? `&pilot=${pilot}` : ''}${keepInv && invPref.override ? `&inv=${invPref.override}` : ''}`;
+// El conmutador vuelve a esta misma vista, sin el ?inv= que fijaría la elección anterior
+const invBack = href(days, pilotId, false);
+
+let summary: Summary | undefined;
+let status: SyncStatus | undefined;
+let inventory: Inventory | undefined;
+let geo: GeoMap | undefined;
+let pilotList: Pilot[] | undefined;
+let indicators: Indicators | undefined;
+let losses: Losses | undefined;
+let apiError: string | undefined;
+try {
+  // Inventario y mapa son opcionales: si fallan, el resto del dashboard se muestra igual
+  const optional = <T,>(p: Promise<T>) => p.catch((err) => (console.error(err), undefined));
+  [summary, status, inventory, geo, pilotList, indicators, losses] = await Promise.all([
+    getSummary(days, pilotId),
+    getSyncStatus(),
+    // Sin inventario no se piden ni el inventario ni el mapa (que lo dibuja)
+    withInv ? optional(getInventory(pilotId)) : undefined,
+    withInv ? optional(getMap(pilotId)) : undefined,
+    optional(getPilots()),
+    // La línea del Omega bajo el saldo: solo en el consolidado (es una meta de todas las cuentas)
+    pilotId ? undefined : optional(getIndicators()),
+    // Naves perdidas (killmails): opcional, como el inventario
+    optional(getLosses(days, pilotId)),
+  ]);
+} catch (err) {
+  // Un piloto que ya no está vinculado (enlace viejo): volver al consolidado
+  if (pilotId && err instanceof ApiError && err.status === 404) return Astro.redirect(href(days));
+  apiError = err instanceof Error ? err.message : String(err);
+}
+const selected = pilotId ? summary?.characters.find((c) => c.id === pilotId) : undefined;
+// Primer uso: sin pilotos, o con pilotos pero ningún movimiento guardado todavía (primer sync)
+const noPilots = !!summary && summary.characters.length === 0;
+const waiting = !!summary && summary.characters.length > 0 && !pilotId && !summary.coverage.firstEntryAt;
+const dashboard = !!summary && summary.characters.length > 0 && !waiting;
+// Neto consolidado = suma de los netos por piloto (el trading se pliega por piloto, pero el neto es aditivo)
+const allNet = summary?.characters.reduce((n, c) => n + c.net, 0) ?? 0;
+
+const synced = q.get('synced');
+const syncErrors = q.get('syncErrors');
+const syncFailed = q.get('syncFailed');
+
+// Patrimonio consolidado y proporciones para las barras de desglose
+const inventoryValue = inventory && inventory.stacks > 0 ? inventory.value : 0;
+// Sin inventario, la cifra es solo el saldo de los wallets
+const netWorth = (summary?.balance ?? 0) + (withInv ? inventoryValue : 0);
+const share = (part: number, total: number) => (total > 0 ? Math.max(0, Math.min(1, part / total)) : 0);
+const flowTotal = (summary?.totals.income ?? 0) + (summary?.totals.expenses ?? 0);
+
+// Sync más reciente entre todos los personajes: gobierna el aviso global de datos viejos
+const globalLastSync = summary?.characters
+  .map((c) => c.lastSyncAt)
+  .filter((d): d is string => !!d)
+  .sort()
+  .at(-1);
+// Frescura de la tarjeta: en la vista de un piloto, la de ese piloto (no la del más reciente de todos)
+const lastSync = selected ? (selected.lastSyncAt ?? undefined) : globalLastSync;
+
+// Antigüedad: datos «viejos» cuando superan dos intervalos de sync (o 2 h si el cron está apagado)
+const staleAfterMs = 2 * (status?.enabled ? status.intervalMin : 60) * 60_000;
+const isStale = (iso: string | null | undefined) => !iso || Date.now() - new Date(iso).getTime() > staleAfterMs;
+// Pilotos que necesitan atención: el mismo estado que en /pilotos (error, primer sync o datos viejos),
+// con su causa corta y la acción que toca, en una línea bajo el filtro
+const pilotStates = new Map((pilotList ?? []).map((p) => [p.id, pilotState(p, m, staleAfterMs, status?.running)]));
+const pilotById = new Map((pilotList ?? []).map((p) => [p.id, p]));
+// La línea de salud es el único sitio con causa y acción: sync roto o viejo, sin primer sync o sin permiso
+const needsAttention = (c: { id: number; lastSyncAt: string | null }) => {
+  const st = pilotStates.get(c.id);
+  const p = pilotById.get(c.id);
+  return st && p ? hasIssue(p, st) : isStale(c.lastSyncAt);
+};
+type HealthAction = 'relink' | 'sync' | 'review' | null;
+// Permisos que le faltan a un piloto, con su nombre corto («inventario», «killmails», «contratos»)
+const PERM_LABELS: Record<string, string> = {
+  [ASSETS_SCOPE]: m.permAssets,
+  [LOSSES_SCOPE]: m.permKillmails,
+  [CONTRACTS_SCOPE]: m.permContracts,
+  [SKILLS_SCOPE]: m.permSkills,
+};
+const missingPerms = (id: number) => (pilotById.get(id)?.missingScopes ?? []).map((s) => PERM_LABELS[s]).filter(Boolean);
+const healthItems =
+  summary?.characters.filter(needsAttention).map((c): { id: number; name: string; cause: string; action: HealthAction } => {
+    const st = pilotStates.get(c.id);
+    if (!st) return { id: c.id, name: c.name, cause: m.healthStale(c.lastSyncAt ? rel(c.lastSyncAt) : m.never), action: 'sync' };
+    if (st.kind === 'pending') return { id: c.id, name: c.name, cause: m.healthPending, action: null };
+    if (st.kind === 'error') {
+      const token = st.hint === m.errToken;
+      const kinds: Record<string, string> = {
+        journal: m.kindJournal,
+        transactions: m.kindTransactions,
+        assets: m.kindAssets,
+        killmails: m.kindKillmails,
+        contracts: m.kindContracts,
+      };
+      const raw = pilotById.get(c.id)?.lastError?.kind ?? '';
+      return { id: c.id, name: c.name, cause: token ? m.healthToken : m.healthFailed(kinds[raw] ?? raw), action: token ? 'relink' : 'review' };
+    }
+    // Sync al día, pero le falta algún permiso (inventario, killmails, contratos): se arregla revinculando
+    const perms = missingPerms(c.id);
+    if (st.kind === 'ok') return { id: c.id, name: c.name, cause: m.healthMissing(perms), action: 'relink' };
+    // Sin primer sync y sin algún permiso: revincular da los permisos y lanza el primer sync
+    if (!c.lastSyncAt && perms.length) return { id: c.id, name: c.name, cause: `${m.healthNoFirst} · ${m.healthMissing(perms)}`, action: 'relink' };
+    return { id: c.id, name: c.name, cause: c.lastSyncAt ? m.healthStale(rel(c.lastSyncAt)) : m.healthNoFirst, action: 'sync' };
+  }) ?? [];
+// Pilotos con el sync al día (un permiso que falta no cuenta aquí: no hace viejos los datos)
+const freshCount =
+  summary?.characters.filter((c) => {
+    const st = pilotStates.get(c.id);
+    return st ? st.kind === 'ok' : !isStale(c.lastSyncAt);
+  }).length ?? 0;
+// Estado del piloto filtrado: si está roto o viejo, toda la tarjeta de Neto lo dice
+const selectedState = selected ? pilotStates.get(selected.id) : undefined;
+const selectedBroken = !!selectedState && selectedState.kind !== 'ok';
+// Piloto filtrado sin ningún sync: no hay datos, y un «0 ISK» se leería como un dato. Estado vacío propio
+const pilotEmpty = !!selected && !selected.lastSyncAt;
+// Su acción ya está en el estado vacío: la línea de salud no la repite
+const healthShown = pilotEmpty ? healthItems.filter((h) => h.id !== selected!.id) : healthItems;
+// Consolidado: cuánto del neto viene de pilotos con datos viejos o rotos. Una sola línea que cuantifica
+// (el neto no cambia de color; quién y por qué está en la línea de salud)
+const staleNetPilots = !selected
+  ? (summary?.characters ?? []).filter((c) => c.lastSyncAt && c.net !== 0 && pilotStates.get(c.id) && pilotStates.get(c.id)!.kind !== 'ok')
+  : [];
+// El neto de cada piloto ya es sin lo movido con tus otros pilotos: eso no sale del consolidado, solo cambia de wallet
+const staleNet = staleNetPilots.reduce((n, c) => n + c.net, 0);
+const staleNetOldest = staleNetPilots.map((c) => c.lastSyncAt!).sort()[0];
+// «hace 3 d» no se parte en dos líneas
+const nbsp = (text: string) => text.replace(/ /g, '\u00a0');
+// Vista de un piloto con el sync atascado: «Hoy» no es cero, es desconocido; el gráfico acaba en su último sync
+const todayUnknown =
+  !!selected && selectedBroken && !!selected.lastSyncAt && selected.lastSyncAt.slice(0, 10) < new Date().toISOString().slice(0, 10);
+const chartLastDate = selected && selectedBroken && selected.lastSyncAt ? selected.lastSyncAt.slice(0, 10) : null;
+// Conciliación de la revisión de mercado: lo que dice el wallet. Las ventas son market_transaction; las compras,
+// market_escrow (así las asienta ESI para el comprador; market_transaction negativo en datos antiguos) más la
+// reposición de naves perdidas, que está en PvP pero también son compras de mercado
+// (y el PLEX, que va en «PLEX / cuentas» pero también se compra y se vende en el mercado)
+const marketRefs = (summary?.byActivity ?? [])
+  .filter((a) => a.activity === 'trading' || a.activity === 'accounts')
+  .flatMap((a) => a.refTypes)
+  .filter((r) => r.refType === 'market_transaction' || r.refType === 'market_escrow');
+const walletMarket = summary
+  ? {
+      sold: marketRefs.reduce((n, r) => n + r.income, 0),
+      bought: marketRefs.reduce((n, r) => n + r.expenses, 0) + summary.shipFlow.replacement,
+    }
+  : undefined;
+// «Todos» al principio de la franja: se queda fijo en móvil mientras la fila se desliza
+const firstHistory = summary?.coverage.firstEntryAt ? date(summary.coverage.firstEntryAt) : null;
+// El mapa protagoniza la primera pantalla solo cuando hay algo que contar hoy (ISK ganado en algún sistema);
+// si no, baja junto al inventario y Patrimonio queda como una franja compacta
+const showMap = withInv && !!geo && geo.nodes.some((n) => n.earnedToday > 0);
+const mapBelow = withInv && !!geo && !showMap && geo.nodes.length > 0;
+// Antigüedad de los precios del inventario, como frescura: se refrescan en un sync si tienen más de 1 h
+const pricesOld =
+  !!inventory?.pricesUpdatedAt && Date.now() - new Date(inventory.pricesUpdatedAt).getTime() > staleAfterMs + 3_600_000;
+// Lo más valioso valora el PLEX con la media de ESI; Indicadores, con su venta más baja: si aparece, se dice
+const PLEX_TYPE_ID = 44992;
+// Naves perdidas hoy (día de EVE): «Hoy» lo dice, es cuando más importa la factura
+const todayIso = new Date().toISOString().slice(0, 10);
+const lostTodayList = losses?.losses.filter((l) => l.time.slice(0, 10) === todayIso) ?? [];
+// Omega de todas las cuentas, con el mismo cálculo que Indicadores (saldo de los wallets + PLEX guardado)
+const omega = !pilotId && pilotList?.length ? indicators?.omega : undefined;
+const firstDate = summary?.coverage.firstEntryAt?.slice(0, 10) ?? null;
+const partialHistory = summary && summary.coverage.firstEntryAt && summary.coverage.coveredDays < days;
+
+// Signo del neto como estado semántico (verde/rojo + flecha), no como decoración
+const sign = (v: number) => (v > 0 ? 'pos' : v < 0 ? 'neg' : 'zero');
+const delta = summary && summary.previous.complete ? summary.totals.net - summary.previous.net : undefined;
+// Resultado de juego: el neto del wallet sin el PLEX (el coste de las cuentas, aparte: decisión del usuario) y
+// menos el patrimonio de las naves perdidas que no volvió (ventana cerrada) o falta por reponer (estimado).
+// La reposición, el courier y el seguro ya están en el neto (PvP)
+const notBack = losses?.totals.unreplaced ?? 0;
+const toReplace = losses?.totals.toReplace ?? 0;
+const accountsNet = summary?.byActivity.find((a) => a.activity === 'accounts')?.net ?? 0;
+const hasAccounts = Math.abs(accountsNet) >= 0.5;
+const showResult = !!summary && ((!!losses && notBack + toReplace >= 0.5) || hasAccounts);
+const headline = summary ? summary.totals.net - (showResult ? accountsNet + notBack + toReplace : 0) : 0;
+// Las actividades de la tarjeta son las de juego: el PLEX va en su propia línea al pie
+const cardActivities = summary?.byActivity.filter((a) => a.activity !== 'accounts') ?? [];
+// Movido con tus otros pilotos: no está en ningún neto. En la vista de un piloto, en los dos sentidos (lo que recibió
+// y lo que envió) y lo que cambió su wallet con ello, que es lo que ve en el juego
+const internalNote = !summary
+  ? null
+  : selected
+    ? summary.internalReceived || summary.internalSent
+      ? m.internalPilotBoth(
+          summary.internalReceived ? fmt(summary.internalReceived) : null,
+          summary.internalSent ? fmt(summary.internalSent) : null,
+          fmt(selected.walletChange, { sign: true }),
+        )
+      : null
+    : summary.internalTransfers > 0
+      ? m.internal(fmt(summary.internalTransfers))
+      : null;
+// Pie de la tarjeta: naves perdidas (lo firme con su signo, lo estimado en gris). En el consolidado, cuánto de lo
+// firme ya está en el neto (PvP); en la vista de un piloto no, porque otro pudo pagar la reposición de sus naves
+const lossesFirm = losses?.totals.firmCost ?? 0;
+const lossesInNet = !selected && losses ? losses.totals.walletEffect : 0;
+const lossesOnlyEstimate = Math.abs(lossesFirm) < 0.5 && toReplace >= 0.5;
+
+// Neto con cobertura parcial: el título lo dice (90 días pedidos, 42 con historial)
+const coverageNote = partialHistory && summary ? ` (${m.onlyCovered(summary.coverage.coveredDays)})` : '';
+// Desglose por actividad en la tarjeta de Neto (orden fijo de la API: PvE, PvP, Trading, Otros)
+const actMax = Math.max(1, ...cardActivities.map((a) => Math.abs(a.net)));
+const actBar = (v: number) => (v >= 0 ? `left:50%;width:${(v / actMax) * 50}%` : `right:50%;width:${(-v / actMax) * 50}%`);
+const out = (v: number) => (v ? -v : 0);
+// Unidades («3.840 PLEX») con el formato del idioma
+const count = (n: number) => new Intl.NumberFormat(lang).format(n);
+// Si un tipo de movimiento es casi toda la actividad (las donaciones en Otros), el detalle lo nombra
+const mainRef = (a: NonNullable<typeof summary>['byActivity'][number]) => {
+  const top = a.refTypes[0];
+  return top && a.refTypes.length > 1 && Math.abs(top.net) >= 0.6 * (a.income + a.expenses)
+    ? ` · ${m.mainlyRef(refTypeLabel(top.refType, lang), fmt(top.net, { sign: true }))}`
+    : '';
+};
+
+// Rango real del período en hora de EVE, para el subtítulo de la navegación
+const range = summary ? `${date(summary.period.from)} – ${date(summary.period.to)}` : undefined;
+
+// Las estructuras de jugadores no tienen nombre sin el scope de estructuras
+const locationLabel = (id: number, name: string | null) =>
+  name ?? (id > 1_000_000_000_000 ? m.structure(id) : `#${id}`);
+// "Jita IV - Moon 4 - Caldari Navy Assembly Plant" → "Jita IV - Moon 4" (el nombre completo va en el tooltip)
+const shortStation = (name: string) => name.split(' - ').slice(0, 2).join(' - ');
+// Ubicaciones en el espacio (raíz = un sistema, no una estación): «Amarr» a secas se confundía con la estación
+const inSpaceRange = (id: number) => id >= 30_000_000 && id <= 32_999_999;
+const locationRows: BarRow[] =
+  inventory?.byLocation.map((l) => {
+    const full = locationLabel(l.locationId, l.name);
+    const label = inSpaceRange(l.locationId) ? `${shortStation(full)} (${m.inSpace})` : shortStation(full);
+    // Las estructuras sin nombre muestran un ID acortado: el completo va en el detalle
+    const id = l.name ? '' : ` (#${l.locationId})`;
+    return { label, value: l.value, detail: `${full}${id} · ${m.stacks(l.stacks)}` };
+  }) ?? [];
+// Lo más valioso: los 6 primeros (8 si el mapa comparte la columna de al lado); el detalle completo está en GET /assets
+const valuableItems = inventory?.topItems.slice(0, mapBelow ? 8 : 6).map((i) => ({ ...i, isk: i.value })) ?? [];
+const inventoryByChar = new Map(inventory?.byCharacter.map((c) => [c.characterId, c.value]));
+// Fila Total de la tabla de pilotos: la suma de los pilotos, que es el consolidado del resumen (la API excluye
+// las transferencias entre tus pilotos también en cada piloto, así que ingresos, gastos y neto suman exacto).
+// Se suma de `characters`, que viene completo también en la vista de un piloto
+const pilotTotals = (summary?.characters ?? []).reduce(
+  (t, c) => ({
+    balance: t.balance + (c.balance ?? 0),
+    inventory: t.inventory + (inventoryByChar.get(c.id) ?? 0),
+    income: t.income + c.income,
+    expenses: t.expenses + c.expenses,
+    net: t.net + c.net,
+    between: t.between + c.internalReceived - c.internalSent,
+    opening: t.opening + (c.openingBalance ?? 0),
+  }),
+  { balance: 0, inventory: 0, income: 0, expenses: 0, net: 0, between: 0, opening: 0 },
+);
+// Entre tus pilotos (recibido − enviado): no es neto (no se ganó en juego), pero cambia el wallet; 0 en el Total
+const between = (c: { internalReceived: number; internalSent: number }) => c.internalReceived - c.internalSent;
+const betweenText = (v: number) => (Math.abs(v) < 0.5 ? '0' : fmt(v, { sign: true }));
+// Saldo anterior + neto + entre tus pilotos = saldo; si no cuadra (movimientos que ESI ya no daba al primer sync),
+// la nota lo dice
+const gapOf = (c: { openingBalance: number | null; balance: number | null; walletChange: number }) =>
+  c.openingBalance === null || c.balance === null ? 0 : c.balance - c.openingBalance - c.walletChange;
+const reconcileGaps = (summary?.characters ?? []).filter((c) => c.lastSyncAt && Math.abs(gapOf(c)) >= 1);
+// En la vista de un piloto la fila Total sigue siendo el consolidado: la etiqueta lo dice
+const withData = (summary?.characters ?? []).filter((c) => c.lastSyncAt).length;
+const totalLabel = selected ? m.pilotsTotalAll : m.pilotsTotal(summary?.characters.length ?? 0, withData);
+// Tortas de la tabla de pilotos: de quién vienen los ingresos y quién gasta (brutos, sin lo movido entre pilotos).
+// El color sigue al piloto (su posición en la lista), también en la muestra de su fila; con más de 7, «Otros»
+const pilotRows = summary?.characters ?? [];
+const pilotColor = (i: number) => `var(--cat-${(pilotRows.length <= 7 ? i : Math.min(i, 6)) + 1})`;
+const pilotIncomeSlices = fold(pilotRows.map((c) => ({ label: c.name, value: c.lastSyncAt ? c.income : 0 })), m.otherPilots);
+const pilotExpensesSlices = fold(pilotRows.map((c) => ({ label: c.name, value: c.lastSyncAt ? c.expenses : 0 })), m.otherPilots);
+// Columnas que ordenan la tabla (y las tarjetas en móvil): clave del data-* de cada fila y su etiqueta
+const sortCols = [
+  { key: 'name', label: m.pilot, cls: '' },
+  { key: 'opening', label: m.openingBalance, cls: 'opening' },
+  { key: 'income', label: m.income, cls: '' },
+  { key: 'expenses', label: m.expenses, cls: '' },
+  { key: 'net', label: m.net, cls: '' },
+  { key: 'between', label: m.betweenPilots, cls: '' },
+  { key: 'balance', label: m.balance, cls: 'now-start' },
+  ...(withInv ? [{ key: 'inventory', label: m.inventory, cls: '' }] : []),
+  { key: 'sync', label: m.lastSync, cls: '' },
+];
+const rowData = (c: (typeof pilotRows)[number]) => ({
+  'data-name': c.name,
+  'data-opening': c.openingBalance ?? '',
+  'data-income': c.lastSyncAt ? c.income : '',
+  'data-expenses': c.lastSyncAt ? -c.expenses : '',
+  'data-between': c.lastSyncAt ? between(c) : '',
+  'data-net': c.lastSyncAt ? c.net : '',
+  'data-balance': c.balance ?? '',
+  'data-inventory': inventoryByChar.get(c.id) ?? '',
+  'data-sync': c.lastSyncAt ? new Date(c.lastSyncAt).getTime() : '',
+});
+// Lo que aporta cada piloto a Patrimonio (saldo + inventario): la nota de cobertura dice cuánto es viejo
+const worthByPilot: Record<number, number> = Object.fromEntries(
+  (summary?.characters ?? []).map((c) => [c.id, (c.balance ?? 0) + (inventoryByChar.get(c.id) ?? 0)]),
+);
+// Vista de un piloto que no está al día (o sin permiso de inventario): de cuándo son su saldo y su inventario
+const selectedPilot = selected ? pilotById.get(selected.id) : undefined;
+const selectedNoAssets = !!selectedPilot?.missingScopes.includes(ASSETS_SCOPE);
+const selectedInvAt = selected ? inventory?.byCharacter.find((c) => c.characterId === selected.id)?.updatedAt : undefined;
+const capitalize = (text: string) => text.charAt(0).toUpperCase() + text.slice(1);
+const worthNote =
+  selected && selected.lastSyncAt && (selectedBroken || selectedNoAssets)
+    ? capitalize(
+        [
+          selectedBroken ? m.worthStaleBalance(rel(selected.lastSyncAt)) : null,
+          !withInv
+            ? null
+            : selectedInvAt
+            ? m.worthStaleInventory(rel(selectedInvAt)) + (selectedNoAssets ? ` (${m.scopeMissingShort})` : '')
+            : selectedNoAssets
+              ? m.coverNoInventory(selected.name)
+              : null,
+        ]
+          .filter(Boolean)
+          .join(' · '),
+      )
+    : '';
+---
+
+<Base
+  section="resumen"
+  status={status}
+  pilots={summary?.characters.length}
+  pilotIssues={(pilotList ?? []).filter((p) => hasIssue(p, pilotStates.get(p.id)!)).length}
+>
+    {dashboard && (
+    <nav class="main-nav shell" aria-label={m.period} slot="nav">
+      <div class="nav-tabs">
+        {
+          PERIODS.map((p) => (
+            <a class="nav-tab" href={href(p, pilotId)} aria-current={p === days ? 'true' : undefined}>
+              <Icon name="clock" />
+              {m.days(p)}
+            </a>
+          ))
+        }
+      </div>
+      <p class="period-meta">
+        {range && <span>{range} · {m.eveTime}</span>}
+        {
+          partialHistory && (
+            <span class="coverage" title={m.coverageTitle}>
+              <Icon name="info" />
+              {m.coverage(date(summary!.coverage.firstEntryAt!), summary!.coverage.coveredDays, days)}
+            </span>
+          )
+        }
+      </p>
+    </nav>
+    )}
+
+      <h1 class="sr-only">{selected ? m.summaryH1Pilot(selected.name, days) : m.summaryH1(days)}</h1>
+
+      {
+        synced !== null && (
+          <div class="notice">
+            <Icon name="info" />
+            <p>
+              {m.syncDone(synced)}
+              {syncErrors && (
+                <strong>
+                  {' '}
+                  · {m.syncErrors(Number(syncErrors))} <a href={syncLogUrl}>{m.syncLog}</a>
+                </strong>
+              )}
+            </p>
+          </div>
+        )
+      }
+      {
+        /* Aviso global: solo cuando todo el ledger está viejo; un piloto roto lo explica su propia tarjeta */
+        dashboard && isStale(globalLastSync) && (
+          <div class="notice warning" role="status">
+            <Icon name="alert" />
+            <p>
+              <strong>{m.staleTitle}</strong> {m.staleLast(rel(globalLastSync ?? null))}{' '}
+              {status && !status.enabled ? m.staleCronOff : m.staleCronFailed} {m.staleAction}{' '}
+              <a href={syncLogUrl}>{m.syncLog}</a>.
+            </p>
+          </div>
+        )
+      }
+      {
+        syncFailed && (
+          <div class="notice error">
+            <Icon name="alert" />
+            <p>{m.syncFailed} {syncFailed}</p>
+          </div>
+        )
+      }
+
+      {
+        apiError && (
+          <div class="notice error">
+            <Icon name="alert" />
+            <div>
+              <strong>{m.apiDown}</strong>
+              <p class="muted">{apiError}</p>
+              <p>
+                {m.apiRunning} <code>apps/api</code>: <code>bun run dev</code>
+              </p>
+            </div>
+          </div>
+        )
+      }
+
+      {
+        noPilots && <FirstRun slots={PILOT_SLOTS} />
+      }
+      {
+        waiting && <FirstSync pilots={summary!.characters} slots={PILOT_SLOTS} />
+      }
+
+      {
+        dashboard && summary && (
+          <>
+            <nav class="pilot-strip" aria-label={m.filterByPilot}>
+              <ul>
+                <li>
+                  <a
+                    href={href(days)}
+                    aria-current={!pilotId ? 'true' : undefined}
+                    title={m.allPilotsTitle(fullNet(allNet), days)}
+                    aria-label={m.chipLabel(m.allPilots, fmt(allNet, { sign: true }), null)}
+                  >
+                    <span class="pilot-name">{m.allPilots}</span>
+                    <span class:list={['pilot-net', { pos: allNet > 0, neg: allNet < 0 }]}>{fmt(allNet, { sign: true })}</span>
+                  </a>
+                </li>
+                {summary.characters.map((c) => (
+                  <li>
+                    <a
+                      href={href(days, c.id)}
+                      aria-current={c.id === pilotId ? 'true' : undefined}
+                      class:list={{ stale: isStale(c.lastSyncAt) }}
+                      title={m.pilotNetTitle(c.name, fullNet(c.net), days) + (isStale(c.lastSyncAt) ? m.noSyncSince(rel(c.lastSyncAt)) : '')}
+                      aria-label={m.chipLabel(
+                        c.name,
+                        c.lastSyncAt ? fmt(c.net, { sign: true }) : null,
+                        isStale(c.lastSyncAt) ? rel(c.lastSyncAt) : null,
+                      )}
+                    >
+                      {isStale(c.lastSyncAt) && <i class="stale-dot" aria-hidden="true" />}
+                      <span class="pilot-name">{c.name}</span>
+                      <span class:list={['pilot-net', { pos: c.net > 0, neg: c.net < 0 }]}>
+                        {c.lastSyncAt ? fmt(c.net, { sign: true }) : '—'}
+                      </span>
+                      {isStale(c.lastSyncAt) && c.lastSyncAt && <span class="chip-age" aria-hidden="true">{rel(c.lastSyncAt)}</span>}
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </nav>
+
+            <script>
+              // En móvil la fila se desliza: que el piloto activo quede a la vista
+              const strip = document.querySelector<HTMLElement>('.pilot-strip ul');
+              const active = strip?.querySelector<HTMLElement>('[aria-current="true"]');
+              const all = strip?.querySelector<HTMLElement>('li');
+              if (strip && active && all && active.parentElement !== all && strip.scrollWidth > strip.clientWidth) {
+                const want = active.parentElement!.offsetLeft - strip.offsetLeft - all.offsetWidth;
+                const max = strip.scrollWidth - strip.clientWidth;
+                // Si el chip activo es de los últimos, la fila no llega a ponerlo junto a «Todos» y el anterior
+                // asomaría a medias bajo «Todos» (se leería «40 M» sin su signo): se alarga el final de la fila
+                if (want > max) strip.style.paddingRight = `${parseFloat(getComputedStyle(strip).paddingRight) + want - max}px`;
+                strip.scrollLeft = want;
+              }
+            </script>
+
+            {
+              healthShown.length > 0 && (
+                <div class="pilot-health" role="status">
+                  <Icon name="alert" class="stale-icon" />
+                  <ul class="health-full">
+                    {healthShown.map((h) => (
+                      <li>
+                        <span class="health-name">{h.name}:</span> {h.cause}
+                        {h.action === 'relink' && (
+                          <>
+                            {' → '}
+                            <a class="inline-action" href={loginUrl} title={m.relinkAs(h.name)} aria-label={m.relinkAs(h.name)}>{m.relink}</a>
+                          </>
+                        )}
+                        {h.action === 'review' && (
+                          <>
+                            {' → '}
+                            <a class="inline-action" href="/pilotos">{m.healthReview}</a>
+                          </>
+                        )}
+                        {h.action === 'sync' && (
+                          <form method="post" action="/sync" class="sync-form inline">
+                            <input type="hidden" name="back" value={href(days, pilotId)} />
+                            <input type="hidden" name="character" value={h.id} />
+                            {' → '}
+                            <button type="submit" class="inline-action" title={m.syncOneTitle(h.name)}>{m.syncOne}</button>
+                          </form>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )
+            }
+
+            {pilotEmpty && selected && (
+              <section class="panel empty-pilot" aria-labelledby="empty-pilot-title">
+                <h2 id="empty-pilot-title">{m.emptyPilotTitle(selected.name)}</h2>
+                <p>{selectedState?.kind === 'pending' ? m.emptyPilotPending : missingPerms(selected.id).length ? m.emptyPilotRelink : m.emptyPilotLead}</p>
+                <div class="empty-actions">
+                  {/* Si además le falta un permiso, revincular lo da y lanza el primer sync */}
+                  {selectedState?.kind !== 'pending' && missingPerms(selected.id).length > 0 && (
+                    <a class="secondary-button" href={loginUrl} title={m.relinkAs(selected.name)} aria-label={m.relinkAs(selected.name)}>
+                      <Icon name="login" />
+                      <span class="label">{m.relink}</span>
+                    </a>
+                  )}
+                  {selectedState?.kind !== 'pending' && missingPerms(selected.id).length === 0 && (
+                    <form method="post" action="/sync" class="sync-form">
+                      <input type="hidden" name="back" value={href(days, pilotId)} />
+                      <input type="hidden" name="character" value={selected.id} />
+                      <button type="submit" class="secondary-button" title={m.syncOneTitle(selected.name)}>
+                        <Icon name="refresh" />
+                        <span class="label">{m.syncOne}</span>
+                      </button>
+                    </form>
+                  )}
+                  <a class="inline-action" href={href(days)}>{m.backToAll}</a>
+                </div>
+              </section>
+            )}
+
+            {!pilotEmpty && (
+            <section class:list={['glance', { solo: !showMap }]} aria-labelledby="glance-title">
+              <h2 id="glance-title" class="sr-only">{showResult ? m.result : m.net} · {withInv ? m.netWorth : m.walletsOnly}</h2>
+              <div class:list={['panel', 'stat', 'hero-stat', { stale: selectedBroken }]}>
+                <div class="hero-body">
+                  <div class="headline">
+                    <div class="fig">
+                      <span class="label">
+                        <Icon name="activity" />
+                        {showResult
+                          ? selected
+                            ? m.resultPeriodPilot(selected.name, days)
+                            : m.resultPeriod(days)
+                          : selected
+                            ? m.netPeriodPilot(selected.name, days)
+                            : m.netPeriod(days)}
+                        {coverageNote}
+                      </span>
+                      <span class:list={['value', 'signed', sign(headline)]} title={fullNet(headline)}>
+                        {headline !== 0 && <Icon name={headline > 0 ? 'up' : 'down'} class="trend" />}
+                        {fmt(headline, { sign: true })}
+                        <small> ISK</small>
+                        <span class="sr-only">{headline > 0 ? m.gain : headline < 0 ? m.loss : m.even} ({fullNet(headline)})</span>
+                      </span>
+                      {showResult && (
+                        /* De dónde sale: el neto del wallet (lo que miden las actividades, «Hoy» y el gráfico) menos
+                           el patrimonio de las naves que no volvió; lo estimado, en gris */
+                        <p class="versus result-note">
+                          {selected ? m.resultWalletPilot : m.resultWallet}{' '}
+                          <span class="num" title={fullNet(summary.totals.net)}>{fmt(summary.totals.net, { sign: true })}</span>
+                          {hasAccounts && (
+                            <>
+                              {' '}
+                              {m.resultAccounts(accountsNet < 0 ? '+' : '−', nbsp(fmt(Math.abs(accountsNet))))}
+                            </>
+                          )}
+                          {notBack >= 0.5 && (
+                            <>
+                              {' '}
+                              {m.resultNotBack(nbsp(fmt(notBack)))}
+                            </>
+                          )}
+                          {toReplace >= 0.5 && (
+                            <span class="estimate">
+                              {' '}
+                              {m.resultToReplace(nbsp(fmt(toReplace)))}
+                            </span>
+                          )}
+                        </p>
+                      )}
+                      {
+                        delta !== undefined ? (
+                          <p class="versus compare">
+                            {/* La comparación es del neto del wallet (del período anterior no hay resultado) */}
+                            {showResult && <span class="compare-of">{selected ? m.resultCompareOfPilot : m.resultCompareOf} </span>}
+                            {delta === 0 ? (
+                              m.versusSame(days)
+                            ) : (
+                              <span class:list={['delta', sign(delta)]}>
+                                <Icon name={delta > 0 ? 'up' : 'down'} />
+                                {delta > 0
+                                  ? m.versusMore(fmt(delta), days, fmt(summary.previous.net, { sign: true }))
+                                  : m.versusLess(fmt(-delta), days, fmt(summary.previous.net, { sign: true }))}
+                              </span>
+                            )}
+                          </p>
+                        ) : (
+                          <p class="versus">{firstHistory ? m.noPreviousSince(firstHistory, days) : m.noPrevious(days)}</p>
+                        )
+                      }
+                      {staleNet !== 0 && staleNetOldest && (
+                        <p
+                          class="versus stale-share"
+                          title={staleNetPilots.map((c) => `${c.name}: ${fmt(c.net, { sign: true })} (${rel(c.lastSyncAt)})`).join(' · ')}
+                        >
+                          <Icon name="alert" class="stale-icon" />
+                          {m.netStaleShare(fmt(staleNet, { sign: true }), nbsp(rel(staleNetOldest)))}
+                        </p>
+                      )}
+                    </div>
+                    <div class="fig today" title={todayUnknown ? m.todayNoData : m.todayTitle(fullNet(summary.today.net))}>
+                      <span class="label">
+                        <Icon name="clock" />
+                        {m.today}
+                        {/* La cifra la anuncia su valor; aquí solo desde cuándo (o que no hay datos: el «—» va oculto) */}
+                        <span class="sr-only"> · {todayUnknown ? m.todayNoData : m.todaySince}</span>
+                      </span>
+                      {todayUnknown && !summary.today.income && !summary.today.expenses ? (
+                        /* Sin datos de hoy (sync atascado): un «0» se leería como «hoy no pasó nada» */
+                        <span class="value signed zero" aria-hidden="true">—</span>
+                      ) : (
+                        <span class:list={['value', 'signed', sign(summary.today.net)]}>
+                          {summary.today.net !== 0 && <Icon name={summary.today.net > 0 ? 'up' : 'down'} class="trend" />}
+                          {fmt(summary.today.net, { sign: true })}
+                          <small> ISK</small>
+                          <span class="sr-only">{summary.today.net > 0 ? m.gain : summary.today.net < 0 ? m.loss : m.even} ({fullNet(summary.today.net)})</span>
+                        </span>
+                      )}
+                      <p class="versus">
+                        {summary.today.income || summary.today.expenses
+                          ? m.todayFlow(fmt(summary.today.income), fmt(summary.today.expenses))
+                          : todayUnknown
+                            ? m.todayNoData
+                            : m.todayNone}
+                      </p>
+                      {/* Perder una nave no mueve el wallet hoy, pero es cuando más importa: qué nave y cuánto valía
+                          (sin enlace: «Ver naves perdidas», al pie de la tarjeta, ya lleva al panel) */}
+                      {lostTodayList.length > 0 && (
+                        <p class="versus today-lost">
+                          {lostTodayList.length === 1
+                            ? m.todayLostOne(lostTodayList[0].ship ?? '?', fmt(lostTodayList[0].value), lostTodayList[0].insurance > 0)
+                            : m.todayLostMany(lostTodayList.length, fmt(lostTodayList.reduce((n, l) => n + l.value, 0)))}
+                        </p>
+                      )}
+                      {
+                        selected ? (
+                          /* Un solo piloto: de cuándo son sus datos. La causa y la acción están en la línea de salud */
+                          lastSync && (
+                            <p class:list={['versus', 'asof', { stale: selectedBroken }]}>
+                              {selectedBroken && <Icon name="alert" class="stale-icon" />}
+                              {selectedBroken ? m.asOfBroken('') : m.asOfSync('')}
+                              <time datetime={lastSync} data-ago={lastSync}>{rel(lastSync)}</time>
+                            </p>
+                          )
+                        ) : (
+                          lastSync && (
+                            /* Consolidado: cuántos pilotos están al día, en gris; ámbar solo si todo el ledger está viejo */
+                            <p class:list={['versus', 'asof', { stale: isStale(lastSync) }]}>
+                              {isStale(lastSync) && <Icon name="alert" class="stale-icon" />}
+                              {freshCount < summary.characters.length
+                                ? m.asOfPartial(freshCount, summary.characters.length, '')
+                                : m.asOfSync('')}
+                              <time datetime={lastSync} data-ago={lastSync}>{rel(lastSync)}</time>
+                            </p>
+                          )
+                        )
+                      }
+                    </div>
+                  </div>
+                  <div class="composition">
+                    <div class="flow">
+                      <div class="ratio" aria-hidden="true">
+                        {summary.totals.income > 0 && (
+                          <i class="income" style={`flex-grow:${share(summary.totals.income, flowTotal)}`} />
+                        )}
+                        {summary.totals.expenses > 0 && (
+                          <i class="expenses" style={`flex-grow:${share(summary.totals.expenses, flowTotal)}`} />
+                        )}
+                      </div>
+                      <dl class="breakdown">
+                        <div>
+                          <dt>
+                            <i class="key income" />
+                            {m.income}
+                          </dt>
+                          <dd title={full(summary.totals.income)}>{fmt(summary.totals.income)}</dd>
+                        </div>
+                        <div>
+                          <dt>
+                            <i class="key expenses" />
+                            {m.expenses}
+                          </dt>
+                          <dd title={full(-summary.totals.expenses)}>{fmt(-summary.totals.expenses)}</dd>
+                        </div>
+                      </dl>
+                      {/* A 520–879 px de tarjeta, la nota va aquí: si no, queda un hueco bajo Ingresos/Gastos */}
+                      {internalNote && <span class="sub in-flow">{internalNote}</span>}
+                    </div>
+                    {
+                      cardActivities.length > 0 && (
+                        <div class="acts-block">
+                          <p class="acts-title">{m.byActivityPeriod(days)}</p>
+                          <ul class="acts" aria-label={m.byActivity}>
+                            {cardActivities.map((a) => (
+                              /* El detalle completo va en el title de la barra (oculta al lector): la fila se oye una vez */
+                              <li>
+                                <span class="act-name">{m.activityName[a.activity]}<span class="sr-only"> ({m.activityHint[a.activity]})</span></span>
+                                <span
+                                  class="act-bar"
+                                  aria-hidden="true"
+                                  title={`${m.activityHint[a.activity]} · ${m.activityInOut(full(a.income), full(out(a.expenses)))}${mainRef(a)}`}
+                                >
+                                  <i class:list={[sign(a.net)]} style={actBar(a.net)} />
+                                </span>
+                                <span class:list={['act-net', sign(a.net)]}>{fmt(a.net, { sign: true })}</span>
+                              </li>
+                            ))}
+                          </ul>
+                          <p class="acts-note">{m.actsNote}</p>
+                          <a class="acts-link" href="#por-actividad">
+                            {m.activityDetailLink}
+                            <i class="chev" aria-hidden="true" />
+                          </a>
+                        </div>
+                      )
+                    }
+                  </div>
+                  <div class="hero-foot">
+                    {losses && losses.totals.count > 0 && (
+                      /* Lo que costaron las naves perdidas, a todo el ancho (no es una sexta actividad): lo firme
+                         con su signo, cuánto de ello ya está en el neto (PvP) y lo estimado en gris */
+                      <p class="foot-losses">
+                        <span>{m.actsLosses}</span>
+                        {lossesOnlyEstimate ? (
+                          /* Nada firme aún (ventanas abiertas sin reponer): la cifra es la estimación, en gris */
+                          <span class="foot-losses-value estimate" title={fullNet(-toReplace)}>
+                            ~{fmt(-toReplace, { sign: true })}
+                            <span class="sr-only"> ({m.lossEstimate})</span>
+                          </span>
+                        ) : (
+                          <>
+                            <span class:list={['foot-losses-value', sign(lossesFirm)]} title={fullNet(lossesFirm)}>
+                              {fmt(lossesFirm, { sign: true })}
+                            </span>
+                            {lossesInNet !== 0 && Math.abs(lossesInNet - lossesFirm) >= 0.5 && (
+                              <span class="foot-losses-split">{m.actsInPvp(fmt(lossesInNet, { sign: true }))}</span>
+                            )}
+                            {toReplace >= 0.5 && <span class="foot-losses-pending">{m.actsPending(fmt(toReplace))}</span>}
+                          </>
+                        )}
+                        <a class="inline-action" href="#perdidas">{nbsp(m.actsLossesLink)}</a>
+                      </p>
+                    )}
+                    {hasAccounts && (
+                      /* El PLEX: el coste de las cuentas, aparte del resultado de juego; el Omega está en Indicadores */
+                      <p class="foot-accounts">
+                        <span>{m.accountsLine}</span>
+                        <span class:list={['foot-losses-value', sign(accountsNet)]} title={fullNet(accountsNet)}>
+                          {fmt(accountsNet, { sign: true })}
+                        </span>
+                        <span class="foot-losses-split">
+                          {[
+                            summary.accounts.plexBought ? m.plexBought(count(summary.accounts.plexBought)) : null,
+                            summary.accounts.plexSold ? m.plexSold(count(summary.accounts.plexSold)) : null,
+                          ]
+                            .filter(Boolean)
+                            .join(' · ')}
+                        </span>
+                        {!selected && (
+                          <a class="inline-action" href="/indicadores">
+                            {m.accountsOmegaLink}
+                          </a>
+                        )}
+                      </p>
+                    )}
+                    {internalNote && <span class="sub at-end">{internalNote}</span>}
+                  </div>
+                </div>
+              </div>
+              <div class:list={['panel', 'stat', 'worth', { compact: !showMap, stale: selectedBroken }]}>
+                <div class="worth-head">
+                  <div>
+                    <span class="label">
+                      <Icon name="wallet" />
+                      {withInv ? m.netWorth : m.walletsOnly}
+                    </span>
+                    <span class="value" title={full(netWorth)}>
+                      {fmt(netWorth)}
+                      <small> ISK</small>
+                    </span>
+                  </div>
+                  {withInv && (
+                  <dl class="breakdown">
+                    <div>
+                      <dt>
+                        <i class="key balance" />
+                        {m.wallets}
+                      </dt>
+                      <dd title={full(summary.balance)}>{fmt(summary.balance)}</dd>
+                    </div>
+                    <div>
+                      <dt>
+                        <i class="key inventory" />
+                        {m.inventory}
+                      </dt>
+                      <dd title={inventoryValue ? full(inventoryValue) : m.noInventory}>
+                        {inventoryValue ? fmt(inventoryValue) : '—'}
+                      </dd>
+                    </div>
+                  </dl>
+                  )}
+                  {/* Qué cuenta en el patrimonio: solo wallets (lo que paga el Omega) o + inventario. Se recuerda (cookie) */}
+                  <form class="inv-toggle" method="get" action="/inv" role="group" aria-label={m.invToggle}>
+                    <input type="hidden" name="back" value={invBack} />
+                    <button type="submit" name="to" value="0" aria-pressed={withInv ? 'false' : 'true'}>{m.invWallets}</button>
+                    <button type="submit" name="to" value="1" aria-pressed={withInv ? 'true' : 'false'}>{m.invPlus}</button>
+                  </form>
+                </div>
+                {omega && omega.missing !== null && (
+                  <p class="omega-line">
+                    {omega.missing > 0 ? m.omegaLine(fmt(omega.missing)) : m.omegaLineCovered}
+                    {' · '}
+                    <a class="inline-action" href="/indicadores">{m.indicators}</a>
+                  </p>
+                )}
+                {!selected && pilotList && (
+                  <CoverageNote
+                    pilots={pilotList}
+                    staleAfterMs={staleAfterMs}
+                    syncRunning={status?.running}
+                    amounts={worthByPilot}
+                    walletOnly={!withInv}
+                  />
+                )}
+                {worthNote && (
+                  <p class="worth-note">
+                    <Icon name="alert" class="stale-icon" />
+                    {worthNote}
+                  </p>
+                )}
+                {showMap && geo && <NewEdenMap map={geo} />}
+              </div>
+            </section>
+            )}
+
+            {!pilotEmpty && (
+            <section class:list={['panel', { 'chart-stale': selectedBroken }]}>
+              <div class="panel-heading">
+                <h2>{m.dailyFlow}</h2>
+                <span class="meta">{m.eveTimeUtc}</span>
+              </div>
+              <div class="panel-body">
+                <DailyChart daily={summary.daily} firstDate={firstDate} lastDate={chartLastDate} />
+              </div>
+            </section>
+            )}
+
+            {!pilotEmpty && <ActivityList activities={summary.byActivity} />}
+
+            {!pilotEmpty && losses && <ShipLosses losses={losses} days={days} pilotName={selected?.name} />}
+
+            <section class="panel" data-pilots-panel>
+              <div class="panel-heading">
+                <h2 id="pilotos">{m.pilotsPeriod(days)}</h2>
+                <a class="meta link" href="/pilotos">
+                  <Icon name="users" />
+                  {m.managePilots}
+                </a>
+              </div>
+              {(pilotTotals.income > 0 || pilotTotals.expenses > 0) && (
+                <div class="panel-body shares pilot-shares">
+                  {pilotTotals.income > 0 && (
+                    <figure class="caption-only">
+                      <Donut slices={pilotIncomeSlices} label={m.shareIncomePilot} format={fmt} lang={lang} center={fmt(pilotTotals.income)} centerSub="ISK" />
+                      <figcaption>{m.shareIncomePilot}</figcaption>
+                    </figure>
+                  )}
+                  {pilotTotals.expenses > 0 && (
+                    <figure class="caption-only">
+                      <Donut slices={pilotExpensesSlices} label={m.shareExpensesPilot} format={fmt} lang={lang} center={fmt(pilotTotals.expenses)} centerSub="ISK" />
+                      <figcaption>{m.shareExpensesPilot}</figcaption>
+                    </figure>
+                  )}
+                </div>
+              )}
+              {/* Móvil: las tarjetas no tienen cabecera que ordene; un selector hace lo mismo */}
+              <div class="cards-sort">
+                <label class="sort-select">
+                  {m.sortBy}
+                  <select data-sort-select>
+                    <option value="">{m.sortOriginal}</option>
+                    {sortCols.map((col) => (
+                      <option value={col.key}>{col.label}</option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <div class="scroll pilots-table" role="group" aria-label={m.pilots}>
+                <table class="pilots">
+                  <thead>
+                    <tr>
+                      {/* Saldo anterior + (ingresos − gastos + entre tus pilotos = neto) = saldo; del período a «ahora»
+                          (saldo, inventario, último sync) tras una línea. Cada cabecera ordena la tabla */}
+                      {sortCols.map((col) => (
+                        <th class={col.cls || undefined} aria-sort="none">
+                          <button type="button" class="sort-button" data-sort={col.key} title={m.sortByCol(col.label)}>
+                            {col.label}
+                          </button>
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {summary.characters.map((c, i) => (
+                      <tr class:list={{ selected: c.id === pilotId && !pilotEmpty }} aria-current={c.id === pilotId ? 'true' : undefined} {...rowData(c)}>
+                        <td>
+                          <span class="who">
+                            <i class="swatch" style={`background: ${pilotColor(i)}`} aria-hidden="true" />
+                            <img
+                              src={`https://images.evetech.net/characters/${c.id}/portrait?size=64`}
+                              alt=""
+                              width="30"
+                              height="30"
+                              loading="lazy"
+                              onerror="this.style.visibility='hidden'"
+                            />
+                            {c.name}
+                          </span>
+                        </td>
+                        <td
+                          class="opening"
+                          title={
+                            c.openingBalance === null || !c.openingAt
+                              ? undefined
+                              : `${full(c.openingBalance)} · ${c.openingPartial ? m.openingPartialTitle(longDate(c.openingAt, lang)) : m.openingTitle(longDate(c.openingAt, lang))}`
+                          }
+                        >
+                          {c.openingBalance === null ? '—' : fmt(c.openingBalance)}
+                        </td>
+                        <td title={c.lastSyncAt ? full(c.income) : undefined}>{c.lastSyncAt ? fmt(c.income) : '—'}</td>
+                        <td title={c.lastSyncAt ? full(out(c.expenses)) : undefined}>{c.lastSyncAt ? fmt(out(c.expenses)) : '—'}</td>
+                        <td class:list={{ pos: c.net > 0, neg: c.net < 0 }} title={c.lastSyncAt ? fullNet(c.net) : undefined}>
+                          {c.lastSyncAt ? fmt(c.net, { sign: true }) : '—'}
+                        </td>
+                        <td class="between" title={c.lastSyncAt ? m.betweenPilotsTitle(c.name, full(c.internalReceived), full(c.internalSent)) : undefined}>
+                          {c.lastSyncAt ? betweenText(between(c)) : '—'}
+                        </td>
+                        <td class="now-start" title={c.balance === null ? m.noEntries : full(c.balance)}>
+                          {c.balance === null ? '—' : fmt(c.balance)}
+                        </td>
+                        {withInv && (
+                          <td title={inventoryByChar.has(c.id) ? full(inventoryByChar.get(c.id)!) : m.noInventory}>
+                            {inventoryByChar.has(c.id) ? fmt(inventoryByChar.get(c.id)!) : '—'}
+                          </td>
+                        )}
+                        <td class:list={['last-sync', { stale: isStale(c.lastSyncAt) }]}>
+                          {isStale(c.lastSyncAt) && <Icon name="alert" class="stale-icon" />}
+                          {c.lastSyncAt ? <time datetime={c.lastSyncAt} data-ago={c.lastSyncAt}>{rel(c.lastSyncAt)}</time> : m.never}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                  <tfoot>
+                    <tr>
+                      <th scope="row">{totalLabel}</th>
+                      <td class="opening" title={full(pilotTotals.opening)}>{fmt(pilotTotals.opening)}</td>
+                      <td title={full(pilotTotals.income)}>{fmt(pilotTotals.income)}</td>
+                      <td title={full(out(pilotTotals.expenses))}>{fmt(out(pilotTotals.expenses))}</td>
+                      <td class:list={{ pos: pilotTotals.net > 0, neg: pilotTotals.net < 0 }} title={fullNet(pilotTotals.net)}>
+                        {fmt(pilotTotals.net, { sign: true })}
+                      </td>
+                      <td class="between" title={fullNet(pilotTotals.between)}>{betweenText(pilotTotals.between)}</td>
+                      <td class="now-start" title={full(pilotTotals.balance)}>{fmt(pilotTotals.balance)}</td>
+                      {withInv && <td title={full(pilotTotals.inventory)}>{pilotTotals.inventory ? fmt(pilotTotals.inventory) : '—'}</td>}
+                      <td />
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+              {/* Móvil: una tarjeta por piloto con nombre, neto y último sync; la tabla de 7 columnas se oculta */}
+              <ul class="pilot-cards">
+                {
+                  summary.characters.map((c, i) => (
+                    <li class:list={{ selected: c.id === pilotId && !pilotEmpty }} aria-current={c.id === pilotId ? 'true' : undefined} {...rowData(c)}>
+                      <div class="card-head">
+                        <a class="who" href={href(days, c.id)} title={m.viewLedger(c.name)}>
+                          <i class="swatch" style={`background: ${pilotColor(i)}`} aria-hidden="true" />
+                          <img
+                            src={`https://images.evetech.net/characters/${c.id}/portrait?size=64`}
+                            alt=""
+                            width="28"
+                            height="28"
+                            loading="lazy"
+                            onerror="this.style.display='none'"
+                          />
+                          {c.name}
+                        </a>
+                        <span class:list={['last-sync', { stale: isStale(c.lastSyncAt) }]}>
+                          {isStale(c.lastSyncAt) && <Icon name="alert" class="stale-icon" />}
+                          {c.lastSyncAt ? <time datetime={c.lastSyncAt} data-ago={c.lastSyncAt}>{rel(c.lastSyncAt)}</time> : m.never}
+                        </span>
+                      </div>
+                      <dl>
+                        <div>
+                          <dt>{m.income}</dt>
+                          <dd title={full(c.income)}>{c.lastSyncAt ? fmt(c.income) : '—'}</dd>
+                        </div>
+                        <div>
+                          <dt>{m.expenses}</dt>
+                          <dd title={full(out(c.expenses))}>{c.lastSyncAt ? fmt(out(c.expenses)) : '—'}</dd>
+                        </div>
+                        <div class:list={['net', { pos: c.net > 0, neg: c.net < 0 }]}>
+                          <dt>{m.net}</dt>
+                          <dd title={fullNet(c.net)}>{c.lastSyncAt ? fmt(c.net, { sign: true }) : '—'}</dd>
+                        </div>
+                        <div class="minor">
+                          <dt>{m.betweenPilots}</dt>
+                          <dd title={c.lastSyncAt ? m.betweenPilotsTitle(c.name, full(c.internalReceived), full(c.internalSent)) : undefined}>
+                            {c.lastSyncAt ? betweenText(between(c)) : '—'}
+                          </dd>
+                        </div>
+                        <div class="minor">
+                          <dt>{m.openingBalance}</dt>
+                          <dd>{c.openingBalance === null ? '—' : fmt(c.openingBalance)}</dd>
+                        </div>
+                        <div class="minor">
+                          <dt>{m.balance}</dt>
+                          <dd>{c.balance === null ? '—' : fmt(c.balance)}</dd>
+                        </div>
+                        {withInv && (
+                          <div class="minor">
+                            <dt>{m.inventory}</dt>
+                            <dd>{inventoryByChar.has(c.id) ? fmt(inventoryByChar.get(c.id)!) : '—'}</dd>
+                          </div>
+                        )}
+                      </dl>
+                    </li>
+                  ))
+                }
+                {/* La suma de los pilotos: el consolidado */}
+                <li class="total">
+                  <div class="card-head">
+                    <span class="who">{totalLabel}</span>
+                  </div>
+                  <dl>
+                    <div>
+                      <dt>{m.income}</dt>
+                      <dd title={full(pilotTotals.income)}>{fmt(pilotTotals.income)}</dd>
+                    </div>
+                    <div>
+                      <dt>{m.expenses}</dt>
+                      <dd title={full(out(pilotTotals.expenses))}>{fmt(out(pilotTotals.expenses))}</dd>
+                    </div>
+                    <div class:list={['net', { pos: pilotTotals.net > 0, neg: pilotTotals.net < 0 }]}>
+                      <dt>{m.net}</dt>
+                      <dd title={fullNet(pilotTotals.net)}>{fmt(pilotTotals.net, { sign: true })}</dd>
+                    </div>
+                    <div class="minor">
+                      <dt>{m.betweenPilots}</dt>
+                      <dd>{betweenText(pilotTotals.between)}</dd>
+                    </div>
+                    <div class="minor">
+                      <dt>{m.openingBalance}</dt>
+                      <dd>{fmt(pilotTotals.opening)}</dd>
+                    </div>
+                    <div class="minor">
+                      <dt>{m.balance}</dt>
+                      <dd>{fmt(pilotTotals.balance)}</dd>
+                    </div>
+                    {withInv && (
+                      <div class="minor">
+                        <dt>{m.inventory}</dt>
+                        <dd>{pilotTotals.inventory ? fmt(pilotTotals.inventory) : '—'}</dd>
+                      </div>
+                    )}
+                  </dl>
+                </li>
+              </ul>
+              <script>
+                // Ordenar la tabla de pilotos (y las tarjetas de móvil, que llevan los mismos data-*) por una columna.
+                // Clic en la cabecera: de mayor a menor (el nombre, de la A a la Z), otro clic invierte, el tercero
+                // vuelve al orden original. Sin dato («—») siempre al final. La fila Total no se mueve
+                const panel = document.querySelector<HTMLElement>('[data-pilots-panel]');
+                const tbody = panel?.querySelector<HTMLTableSectionElement>('table.pilots tbody');
+                const cards = panel?.querySelector<HTMLElement>('.pilot-cards');
+                if (panel && tbody && cards) {
+                  const rows = [...tbody.rows];
+                  const items = [...cards.querySelectorAll<HTMLElement>(':scope > li:not(.total)')];
+                  const totalCard = cards.querySelector<HTMLElement>(':scope > li.total');
+                  const heads = [...panel.querySelectorAll<HTMLTableCellElement>('th[aria-sort]')];
+                  const select = panel.querySelector<HTMLSelectElement>('select[data-sort-select]');
+                  const value = (el: HTMLElement, key: string): string | number | null => {
+                    const v = el.dataset[key];
+                    if (v === undefined || v === '') return null;
+                    return key === 'name' ? v : Number(v);
+                  };
+                  const apply = (key: string, dir: 'asc' | 'desc') => {
+                    const idx = rows.map((_, i) => i);
+                    if (key) {
+                      idx.sort((a, b) => {
+                        const va = value(rows[a], key);
+                        const vb = value(rows[b], key);
+                        if (va === null && vb === null) return a - b;
+                        if (va === null) return 1;
+                        if (vb === null) return -1;
+                        const c = typeof va === 'string' ? va.localeCompare(String(vb), undefined, { sensitivity: 'base' }) : va - Number(vb);
+                        return (c || a - b) * (dir === 'desc' ? -1 : 1);
+                      });
+                    }
+                    for (const i of idx) {
+                      tbody.append(rows[i]);
+                      if (items[i]) cards.append(items[i]);
+                    }
+                    if (totalCard) cards.append(totalCard);
+                    for (const th of heads) {
+                      const k = th.querySelector<HTMLElement>('[data-sort]')?.dataset.sort;
+                      th.setAttribute('aria-sort', k && k === key ? (dir === 'desc' ? 'descending' : 'ascending') : 'none');
+                    }
+                    if (select) select.value = key;
+                  };
+                  const first = (key: string) => (key === 'name' ? 'asc' : 'desc');
+                  for (const th of heads) {
+                    const btn = th.querySelector<HTMLButtonElement>('[data-sort]');
+                    btn?.addEventListener('click', () => {
+                      const key = btn.dataset.sort ?? '';
+                      const cur = th.getAttribute('aria-sort');
+                      if (cur === 'none') apply(key, first(key));
+                      else if ((cur === 'descending') === (first(key) === 'desc')) apply(key, first(key) === 'desc' ? 'asc' : 'desc');
+                      else apply('', 'asc');
+                    });
+                  }
+                  select?.addEventListener('change', () => apply(select.value, first(select.value)));
+                }
+              </script>
+              {/* Dos notas cortas: qué es el Total (en la vista de un piloto, que es el consolidado) y de dónde salen saldo e inventario */}
+              <div class="panel-note pilots-note">
+                <p>
+                  {selected && !pilotEmpty ? (
+                    m.pilotsTotalNotePilot(selected.name)
+                  ) : (
+                    <>
+                      <span class="wide-only">{m.pilotsTotalNote(false)}</span>
+                      <span class="narrow-only">{m.pilotsTotalNote(true)}</span>
+                    </>
+                  )}
+                </p>
+                <p>{m.betweenPilotsNote}</p>
+                <p>
+                  {m.reconcileNote}
+                  {reconcileGaps.length > 0 && m.reconcileGap(reconcileGaps.map((c) => m.reconcileItem(c.name, fmt(gapOf(c), { sign: true }))).join(', '))}
+                </p>
+                <p>
+                  {withInv ? (
+                    <>
+                      {m.noteBalance}
+                      {inventory?.pricesUpdatedAt && (
+                        <span class:list={{ 'prices-old': pricesOld }}>
+                          {pricesOld && <Icon name="alert" class="stale-icon" />}
+                          {m.notePrices(nbsp(rel(inventory.pricesUpdatedAt)))}
+                        </span>
+                      )}
+                      {m.noteBpc}
+                      {inventory && inventory.unpricedTypes > 0 && m.noteUnpriced(inventory.unpricedTypes)}.
+                    </>
+                  ) : (
+                    <>{m.noteBalanceOnly}.</>
+                  )}
+                </p>
+              </div>
+            </section>
+
+            {withInv && !pilotEmpty && inventory && inventory.stacks > 0 && (
+              <div class="split">
+                <div class="stack">
+                  <BarList title={m.whereInventory} kind="inventory" rows={locationRows} limit={11} />
+                  {
+                    mapBelow && geo && (
+                      /* Sin ganancias hoy, el mapa solo repite la lista de arriba: queda plegado */
+                      <details class="panel map-fold" id="mapa">
+                        <summary class="panel-heading">
+                          <h2>{m.mapTitle}</h2>
+                          <span class="meta">{m.seeOnMap}</span>
+                        </summary>
+                        <div class="panel-body">
+                          <NewEdenMap map={geo} />
+                        </div>
+                      </details>
+                    )
+                  }
+                </div>
+                <MarketItems
+                  title={m.mostValuable}
+                  items={valuableItems}
+                  iskLabel={m.value}
+                  priceLabel={m.unitPrice}
+                  empty={m.noInventoryDot}
+                  note={valuableItems.some((i) => i.typeId === PLEX_TYPE_ID) ? m.valuablePlex : undefined}
+                />
+              </div>
+            )}
+
+            {!pilotEmpty && summary.market.items.length > 0 && (
+              <MarketReview market={summary.market} wallet={walletMarket && (walletMarket.sold || walletMarket.bought) ? walletMarket : undefined} />
+            )}
+
+          </>
+        )
+      }
+</Base>
+
+<style>
+  .glance {
+    display: grid;
+    /* El neto lidera (~60 %); Patrimonio y el mapa apoyan */
+    grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr);
+    gap: 16px;
+  }
+  /* Neto del período y «Hoy» como pareja de cifras grandes: contenedor para que dependa del ancho de la tarjeta */
+  .hero-stat {
+    container-type: inline-size;
+  }
+  /* .hero-body es el cuerpo de la tarjeta (los container queries no pueden estilar al propio contenedor).
+     Estrecho: Neto → composición del período → Hoy; «Hoy» ya no se interpone entre el neto y su desglose */
+  .hero-body {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .headline {
+    display: contents;
+  }
+  .fig:not(.today) {
+    order: 1;
+  }
+  /* Estrecho: «Hoy» como fila compacta justo bajo el neto (el par no se separa en móvil); la composición después */
+  .fig.today {
+    order: 2;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 2px 10px;
+    margin-top: 8px;
+    padding-top: 10px;
+    border-top: 1px solid var(--line);
+  }
+  .fig.today .asof {
+    flex-basis: 100%;
+  }
+  .hero-body .sub {
+    order: 4;
+  }
+  .sub.in-flow {
+    display: none;
+  }
+  .fig {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+  }
+  .fig.today .value {
+    font-size: 22px;
+  }
+  /* «Hoy» sin movimientos: un cero enorme parece un fallo; se apaga y se queda pequeño */
+  .fig.today .value.zero {
+    font-size: 22px;
+    color: var(--text-muted);
+  }
+  .composition {
+    order: 3;
+    display: grid;
+    gap: 14px;
+    margin-top: 8px;
+  }
+  .flow {
+    min-width: 0;
+  }
+  .acts-block {
+    display: grid;
+    align-content: start;
+    gap: 4px;
+    min-width: 0;
+  }
+  .acts-title {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-secondary);
+  }
+  .acts {
+    display: grid;
+    align-content: start;
+    gap: 2px;
+    min-width: 0;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .acts li {
+    display: grid;
+    grid-template-columns: 5.5rem minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 12px;
+    min-height: 28px;
+  }
+  .act-name {
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+  /* Barra divergente desde un eje central: hacia la derecha suma, hacia la izquierda resta */
+  .act-bar {
+    position: relative;
+    height: 8px;
+  }
+  .act-bar::before {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: -4px;
+    bottom: -4px;
+    width: 1px;
+    background: var(--axis);
+  }
+  .act-bar i {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    /* Un neto pequeño frente al mayor no debe quedarse en un píxel */
+    min-width: 3px;
+    background: var(--positive);
+    border-radius: 0 3px 3px 0;
+  }
+  .act-bar i.neg {
+    background: var(--critical);
+    border-radius: 3px 0 0 3px;
+  }
+  /* De dónde sale el resultado: neto del wallet − lo que no volvió − lo estimado (en gris) */
+  .result-note {
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+  /* La cifra dentro de la frase va en la tipografía de la frase (la monoespaciada dejaba un espacio ancho) */
+  .result-note .num {
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .result-note .estimate,
+  .compare-of {
+    color: var(--text-muted);
+  }
+  /* Pie de la tarjeta, a todo el ancho: naves perdidas y transferencias internas */
+  .hero-foot {
+    order: 5;
+    display: grid;
+    gap: 8px;
+    min-width: 0;
+  }
+  .hero-foot:empty {
+    display: none;
+  }
+  .foot-losses {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0 8px;
+    margin-top: 8px;
+    padding-top: 6px;
+    border-top: 1px solid var(--line);
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+  .foot-losses-value {
+    font: 500 13px var(--mono);
+    color: var(--text);
+  }
+  .foot-losses-value.pos {
+    color: var(--positive);
+  }
+  .foot-losses-value.neg {
+    color: var(--critical);
+  }
+  .foot-losses-pending,
+  .foot-losses-value.estimate {
+    color: var(--text-muted);
+  }
+  /* El PLEX, aparte: misma forma que la línea de pérdidas, sin filete propio (comparten el del pie) */
+  .foot-accounts {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0 8px;
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+  .foot-losses + .foot-accounts {
+    margin-top: -4px;
+  }
+  .hero-foot > :first-child:not(.foot-losses):not(.sub) {
+    margin-top: 8px;
+    padding-top: 6px;
+    border-top: 1px solid var(--line);
+  }
+  .foot-losses-split {
+    color: var(--text-muted);
+  }
+  .acts-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    justify-self: start;
+    min-height: 40px;
+    font-size: 13px;
+    color: var(--cyan);
+    text-decoration: none;
+  }
+  .acts-link:hover {
+    text-decoration: underline;
+  }
+  /* Chevrón hacia abajo (una flecha de tendencia se leería como un dato negativo) */
+  .acts-link .chev {
+    width: 7px;
+    height: 7px;
+    margin-top: -3px;
+    border-right: 1.5px solid currentColor;
+    border-bottom: 1.5px solid currentColor;
+    transform: rotate(45deg);
+  }
+  .act-net {
+    min-width: 4.5rem;
+    font: 500 13px var(--mono);
+    letter-spacing: -0.02em;
+    text-align: right;
+    color: var(--text);
+  }
+  .act-net.pos {
+    color: var(--positive);
+  }
+  .act-net.neg {
+    color: var(--critical);
+  }
+  .compare {
+    font-size: 14px;
+    color: var(--text-secondary);
+  }
+  /* La comparación es una frase, no una cifra: en la tipografía de la interfaz, no en monoespaciada */
+  .compare .delta {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+    font: 500 14px/1.35 var(--font);
+  }
+  .compare .delta :global(.icon) {
+    align-self: center;
+    width: 14px;
+    height: 14px;
+  }
+  @container (min-width: 520px) {
+    .headline {
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+    }
+    .fig:not(.today),
+    .fig.today,
+    .composition,
+    .hero-body .sub,
+    .hero-foot {
+      order: 0;
+    }
+    .sub.in-flow {
+      display: block;
+      margin-top: 14px;
+    }
+    .sub.at-end {
+      display: none;
+    }
+    .fig.today {
+      flex-direction: column;
+      flex-wrap: nowrap;
+      gap: 6px;
+      margin-top: 0;
+      padding: 0 0 0 24px;
+      border-top: 0;
+      border-left: 1px solid var(--line);
+    }
+    .fig.today .asof {
+      flex-basis: auto;
+    }
+    .fig.today .value {
+      font-size: 44px;
+    }
+    .fig.today :global(.trend) {
+      width: 28px;
+      height: 28px;
+    }
+    .fig.today .value.zero {
+      font-size: 28px;
+    }
+    /* Una línea separa el par del período/hoy de la composición del período: así las actividades no se leen como las de hoy */
+    .composition {
+      grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+      gap: 0;
+      margin-top: 14px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+    }
+    .flow {
+      padding-right: 24px;
+    }
+    .acts-block {
+      padding-left: 24px;
+      border-left: 1px solid var(--line);
+    }
+  }
+  /* Ancho completo (sin mapa al lado): Neto | Hoy | Por actividad en tres columnas, Ingresos/Gastos bajo el par */
+  @container (min-width: 880px) {
+    .hero-body {
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr) minmax(0, 1.2fr);
+      grid-template-rows: auto 1fr auto;
+      column-gap: 0;
+      row-gap: 14px;
+    }
+    .headline,
+    .composition {
+      display: contents;
+    }
+    .fig:not(.today) {
+      grid-column: 1;
+      grid-row: 1;
+      padding-right: 24px;
+    }
+    .fig.today {
+      grid-column: 2;
+      grid-row: 1;
+    }
+    .flow {
+      grid-column: 1 / 3;
+      grid-row: 2;
+      padding: 14px 24px 0 0;
+      border-top: 1px solid var(--line);
+    }
+    .acts-block {
+      grid-column: 3;
+      grid-row: 1 / 3;
+    }
+    .hero-foot {
+      grid-column: 1 / -1;
+      grid-row: 3;
+    }
+    .sub.in-flow {
+      display: none;
+    }
+    .sub.at-end {
+      display: block;
+    }
+  }
+  .signed {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+  }
+  /* :global porque la clase se pasa al svg del componente Icon, que no lleva el ámbito de esta página */
+  .signed :global(.trend) {
+    align-self: center;
+    width: 28px;
+    height: 28px;
+    stroke-width: 2;
+  }
+  .pos,
+  .stat .value.pos {
+    color: var(--positive);
+  }
+  .neg,
+  .stat .value.neg {
+    color: var(--critical);
+  }
+  .hero-stat .value.zero {
+    color: var(--text);
+  }
+  .versus {
+    font-size: 13px;
+    color: var(--text-muted);
+    /* Sin una palabra suelta en la última línea («… hace 3 / d») */
+    text-wrap: pretty;
+  }
+  .asof {
+    display: block;
+  }
+  .asof :global(.stale-icon) {
+    margin-right: 6px;
+    vertical-align: -2px;
+  }
+  .asof.stale {
+    color: var(--warning);
+  }
+  .asof a {
+    /* Zona táctil ampliada sin mover el texto */
+    padding-block: 12px;
+    margin-block: -12px;
+  }
+  /* Pilotos con datos viejos: la causa y el enlace, en una línea bajo el filtro */
+  /* El icono va pegado a la lista (con wrap se quedaba solo en su línea en móvil) */
+  .pilot-health {
+    display: flex;
+    align-items: center;
+    gap: 4px 8px;
+    margin: -4px 0 0;
+    font-size: 13px;
+    color: var(--warning);
+  }
+  .keep {
+    white-space: nowrap;
+  }
+  .pilot-health > :global(.stale-icon) {
+    flex-shrink: 0;
+  }
+  .health-full {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 6px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .health-full li + li::before {
+    content: '·';
+    margin-right: 6px;
+    color: var(--text-muted);
+  }
+  .health-name {
+    color: var(--text-secondary);
+  }
+  /* Piloto filtrado sin ningún sync: en vez de ceros, qué pasa y qué hacer */
+  .empty-pilot {
+    display: grid;
+    justify-items: start;
+    gap: 12px;
+    padding: 28px 32px;
+  }
+  .empty-pilot h2 {
+    margin: 0;
+    font-size: 22px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .empty-pilot p {
+    max-width: 60ch;
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.55;
+    color: var(--text-secondary);
+  }
+  .empty-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px 20px;
+  }
+  .acts-note {
+    margin: 10px 0 0;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  .hero-stat.stale .value.zero {
+    color: var(--text-muted);
+  }
+  /* Piloto roto: también la barra de ingresos/gastos se apaga, como el neto */
+  .hero-stat.stale .ratio i,
+  .hero-stat.stale .key {
+    background: var(--text-muted);
+  }
+  .stale-share :global(.stale-icon) {
+    margin-right: 6px;
+    vertical-align: -2px;
+  }
+  /* Cuantifica sin alarmar: texto neutro, el icono pequeño es la única marca ámbar */
+  .stale-share {
+    color: var(--text-secondary);
+  }
+  .worth :global(.coverage-note),
+  .worth-note {
+    flex-basis: 100%;
+    margin-top: 10px;
+  }
+  .worth-note {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+  /* Piloto filtrado que no está al día: su patrimonio se apaga como su neto */
+  .worth.stale .value,
+  .worth.stale dd {
+    color: var(--text-secondary);
+  }
+  /* …y su gráfico diario también (la franja «Sin sync» marca los días posteriores a su último sync) */
+  .chart-stale :global(.plot),
+  .chart-stale :global(.legend) {
+    filter: saturate(0.15);
+    opacity: 0.75;
+  }
+  .empty-pilot .secondary-button {
+    min-height: 40px;
+  }
+  /* Punto ámbar en el chip: la causa está en la línea de salud */
+  .stale-dot {
+    align-self: center;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--warning);
+  }
+  .map-fold > summary {
+    cursor: pointer;
+    list-style: none;
+    position: relative;
+    padding-left: 40px;
+  }
+  .map-fold > summary::-webkit-details-marker {
+    display: none;
+  }
+  .map-fold > summary::before {
+    content: '';
+    position: absolute;
+    left: 20px;
+    top: 50%;
+    width: 7px;
+    height: 7px;
+    border-right: 1.5px solid var(--text-muted);
+    border-bottom: 1.5px solid var(--text-muted);
+    transform: translateY(-70%) rotate(-45deg);
+    transition: transform 0.18s;
+  }
+  .map-fold[open] > summary::before {
+    transform: translateY(-70%) rotate(45deg);
+  }
+  .map-fold:not([open]) > summary {
+    border-bottom: 0;
+  }
+  .map-fold > summary:hover::before {
+    border-color: var(--cyan);
+  }
+  /* Piloto filtrado roto o viejo: su neto se apaga, como en los chips (un dato viejo no compite con uno real) */
+  .hero-stat.stale .value.signed.pos,
+  .hero-stat.stale .value.signed.neg,
+  .hero-stat.stale .act-net {
+    color: var(--text-secondary);
+  }
+  .hero-stat.stale .act-bar i {
+    background: var(--text-muted);
+  }
+  /* Patrimonio es secundario: un escalón claro por debajo de Neto y de Hoy */
+  .worth .value {
+    font-size: 24px;
+  }
+  /* La comparación con el período anterior es contexto, no otro veredicto: texto neutro, solo la flecha lleva el signo */
+  .delta {
+    font: 500 14px var(--mono);
+  }
+  .delta.pos,
+  .delta.neg {
+    color: var(--text-secondary);
+  }
+  .delta.pos :global(.icon) {
+    color: var(--positive);
+  }
+  .delta.neg :global(.icon) {
+    color: var(--critical);
+  }
+  .worth-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    flex-wrap: wrap;
+    gap: 12px 24px;
+  }
+  .worth-head > div {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .worth .breakdown {
+    grid-template-columns: repeat(2, auto);
+    gap: 20px;
+  }
+  /* Elemento de la rejilla de main: sin esto crece al ancho de los chips en vez de deslizarse */
+  .pilot-strip {
+    min-width: 0;
+  }
+  .pilot-strip ul {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .pilot-strip a {
+    /* Contiene el texto oculto del chip: un absolute se escapaba de la fila deslizable y ensanchaba la página */
+    position: relative;
+    display: inline-flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 7px 12px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--panel-2);
+    color: var(--text-secondary);
+    font-size: 13px;
+    text-decoration: none;
+  }
+  .pilot-strip a:hover {
+    border-color: var(--line-strong);
+    color: var(--text);
+  }
+  /* Filtro activo: estado, por eso en cian */
+  .pilot-strip a[aria-current='true'],
+  .pilot-strip a.stale[aria-current='true'] {
+    border-color: var(--cyan-dim);
+    background: #61cce514;
+    color: var(--text);
+  }
+  .pilot-strip a[aria-current='true'] .pilot-name {
+    font-weight: 600;
+  }
+  /* Tableta: con 6 pilotos la franja partía a uno en una segunda fila; chips algo más compactos */
+  @media (max-width: 1100px) {
+    .pilot-strip ul {
+      gap: 6px;
+    }
+    .pilot-strip a {
+      gap: 8px;
+      padding: 7px 10px;
+    }
+  }
+  /* Móvil: una sola fila deslizable a sangre, para no empujar el neto hacia abajo */
+  @media (max-width: 750px) {
+    .pilot-strip ul {
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      margin: 0 -16px;
+      padding: 0 16px 2px;
+      scrollbar-width: none;
+    }
+    .pilot-strip li {
+      flex-shrink: 0;
+    }
+    /* «Todos» se queda a la vista mientras la fila se desliza: siempre hay vuelta al consolidado */
+    .pilot-strip li:first-child {
+      position: sticky;
+      left: -16px;
+      z-index: 1;
+      margin-left: -16px;
+      padding: 0 12px 0 16px;
+      background: linear-gradient(to right, var(--bg) calc(100% - 12px), transparent);
+    }
+    .pilot-strip ul {
+      mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent);
+    }
+    .pilot-strip a {
+      align-items: center;
+      min-height: 40px;
+    }
+  }
+  .pilot-cards {
+    display: none;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .pilot-shares {
+    border-bottom: 1px solid var(--line);
+  }
+  .cards-sort {
+    display: none;
+    padding: 12px 16px 0;
+  }
+  @media (max-width: 600px) {
+    /* Una línea por piloto, con su acción: en móvil es donde más cuesta ir a Pilotos */
+    .pilot-health {
+      align-items: flex-start;
+    }
+    .health-full {
+      flex-direction: column;
+      gap: 12px;
+    }
+    .health-full li + li::before {
+      content: none;
+    }
+    .empty-pilot {
+      padding: 22px 18px;
+    }
+    .pilots-table {
+      display: none;
+    }
+    .pilot-cards {
+      display: block;
+    }
+    .cards-sort {
+      display: flex;
+    }
+    .pilot-cards li {
+      padding: 0 16px 14px;
+      border-bottom: 1px solid var(--line);
+    }
+    .pilot-cards li.selected {
+      background: #61cce50d;
+      box-shadow: inset 2px 0 var(--cyan);
+    }
+    .card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .card-head .who {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 48px;
+      margin: 0;
+      padding: 0;
+      font-weight: 500;
+      color: var(--text);
+    }
+    .card-head img {
+      border-radius: 4px;
+      border: 1px solid var(--line-strong);
+    }
+    .pilot-cards .last-sync {
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    .pilot-cards .last-sync:not(.stale) {
+      color: var(--text-muted);
+    }
+    .pilot-cards dl {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px 12px;
+      margin: 0;
+    }
+    .pilot-cards dt {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .pilot-cards dd {
+      margin: 2px 0 0;
+      font: 500 16px var(--mono);
+      letter-spacing: -0.03em;
+      color: var(--text);
+    }
+    .pilot-cards .net.pos dd {
+      color: var(--positive);
+    }
+    .pilot-cards .net.neg dd {
+      color: var(--critical);
+    }
+    .pilot-cards .minor dd {
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+    .pilot-cards li.total {
+      border-top: 3px double var(--line-strong);
+      border-bottom: 0;
+    }
+    .pilot-cards li.total .who {
+      font-weight: 600;
+    }
+  }
+  /* Total: cierra la tabla como en un libro de contabilidad (doble línea) */
+  .pilots tfoot th,
+  .pilots tfoot td {
+    border-top: 3px double var(--line-strong);
+    border-bottom: 0;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .pilots tfoot th {
+    font-size: 13px;
+    letter-spacing: 0;
+    text-transform: none;
+    text-align: left;
+  }
+  .pilots tfoot td {
+    font-family: var(--mono);
+  }
+  .pilots tfoot td.pos {
+    color: var(--positive);
+  }
+  .pilots tfoot td.neg {
+    color: var(--critical);
+  }
+  tr.selected td {
+    background: #61cce50d;
+  }
+  tr.selected td:first-child {
+    box-shadow: inset 2px 0 var(--cyan);
+  }
+  /* El enlace ocupa toda la altura de la fila para que sea fácil de acertar (medía 16 px) */
+  .who a {
+    padding-block: 14px;
+    margin-block: -14px;
+    color: inherit;
+    text-decoration: none;
+  }
+  .who a:hover {
+    color: var(--cyan);
+    text-decoration: underline;
+  }
+  .stale {
+    color: var(--warning);
+  }
+  .pilot-strip a.stale {
+    border-color: var(--line);
+  }
+  /* Neto de un dato viejo: apagado, para que no compita con el neto real */
+  .pilot-strip a.stale .pilot-net.pos,
+  .pilot-strip a.stale .pilot-net.neg {
+    color: var(--text-secondary);
+  }
+  .chip-age {
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  :global(.stale-icon) {
+    width: 13px;
+    height: 13px;
+    color: var(--warning);
+  }
+  td.last-sync {
+    color: var(--text-muted);
+  }
+  td.last-sync.stale {
+    color: var(--warning);
+  }
+  .last-sync :global(.stale-icon) {
+    margin-right: 6px;
+    vertical-align: -2px;
+  }
+  /* Conmutador de Patrimonio: control segmentado discreto en la propia tarjeta, estado en cian */
+  .inv-toggle {
+    display: inline-flex;
+    align-self: center;
+    margin-left: auto;
+    padding: 2px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+  }
+  .inv-toggle button {
+    display: inline-flex;
+    align-items: center;
+    min-height: 32px;
+    padding: 0 11px;
+    border: 0;
+    border-radius: 4px;
+    background: none;
+    font: 550 13px var(--font);
+    color: var(--text-secondary);
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .inv-toggle button:hover {
+    color: var(--text);
+  }
+  .inv-toggle button[aria-pressed='true'] {
+    background: #16304070;
+    color: #8addee;
+  }
+  @media (max-width: 750px) {
+    .inv-toggle {
+      margin-left: 0;
+    }
+    .inv-toggle button {
+      min-height: 40px;
+      padding: 0 12px;
+    }
+  }
+  /* La meta que paga el wallet, en una línea neutra con su enlace */
+  .omega-line {
+    margin-top: 12px;
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+  /* Tabla de pilotos: una línea separa el período (ingresos, gastos, neto) de «ahora» (saldo, inventario, sync) */
+  .pilots .now-start {
+    border-left: 1px solid var(--line);
+  }
+  .pilots-note {
+    display: grid;
+    gap: 4px;
+  }
+  .pilots-note p {
+    max-width: 60ch;
+  }
+  .narrow-only {
+    display: none;
+  }
+  @media (max-width: 600px) {
+    .wide-only {
+      display: none;
+    }
+    .narrow-only {
+      display: inline;
+    }
+  }
+  /* La antigüedad de los precios es frescura: no se parte, y el icono va pegado a ella */
+  .prices-old {
+    white-space: nowrap;
+  }
+  .prices-old :global(.stale-icon) {
+    margin: 0 2px 0 4px;
+    vertical-align: -2px;
+  }
+  .period-meta .coverage {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-secondary);
+  }
+  .period-meta .coverage :global(.icon) {
+    width: 14px;
+    height: 14px;
+    color: var(--cyan-dim);
+  }
+  .pilot-net {
+    font: 500 13px var(--mono);
+    color: var(--text);
+  }
+  .pilot-net.pos {
+    color: var(--positive);
+  }
+  .pilot-net.neg {
+    color: var(--critical);
+  }
+  .ratio {
+    display: flex;
+    gap: 2px;
+    height: 6px;
+    margin: 10px 0 4px;
+  }
+  .ratio i {
+    flex-basis: 0;
+    min-width: 2px;
+    border-radius: 2px;
+  }
+  .income {
+    background: var(--income);
+  }
+  .expenses {
+    background: var(--expenses);
+  }
+  .balance {
+    background: var(--balance);
+  }
+  .inventory {
+    background: var(--inventory);
+  }
+  .breakdown {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    margin: 6px 0 0;
+  }
+  .breakdown div {
+    min-width: 0;
+  }
+  .breakdown dt {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+  .breakdown dd {
+    margin: 2px 0 0;
+    font: 500 18px var(--mono);
+    letter-spacing: -0.03em;
+    color: var(--text);
+  }
+  .key {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+  }
+  /* La nota de transferencias internas cierra la tarjeta: queda alineada con la de «sin ubicar» de Patrimonio */
+  .hero-body .sub {
+    margin-top: auto;
+    padding-top: 10px;
+  }
+  .panel-heading a.link {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 40px;
+    font: 500 12px var(--font);
+    color: var(--cyan);
+  }
+  .panel-heading a.link :global(.icon) {
+    width: 14px;
+    height: 14px;
+  }
+  @media (max-width: 900px) {
+    .glance {
+      grid-template-columns: 1fr;
+    }
+  }
+  /* Sin ganancias hoy el mapa baja al inventario: Neto a todo el ancho y Patrimonio como franja compacta */
+  .glance.solo {
+    grid-template-columns: 1fr;
+  }
+  .worth.compact .worth-head {
+    align-items: center;
+  }
+  .stack {
+    display: grid;
+    align-content: start;
+    gap: 20px;
+    min-width: 0;
+  }
+  .pilots th:first-child,
+  /* Entre tus pilotos: con signo pero sin verde/rojo (no es ganancia ni pérdida, solo ISK que cambia de wallet) */
+  .pilots td.between {
+    color: var(--text-secondary);
+  }
+  /* Saldo anterior: antes del período, separado de los flujos del período por una línea */
+  .pilots .opening {
+    border-right: 1px solid var(--line);
+  }
+  .pilots td:first-child {
+    padding-left: 22px;
+  }
+  .pilots th:last-child,
+  .pilots td:last-child {
+    padding-right: 22px;
+  }
+  .panel-heading a.meta:hover {
+    color: var(--cyan);
+    text-decoration: none;
+  }
+  code {
+    font: 12px var(--mono);
+    color: var(--cyan);
+  }
+</style>

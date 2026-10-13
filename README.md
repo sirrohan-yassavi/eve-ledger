@@ -2,7 +2,7 @@
 
 **Are your characters making or losing ISK?** EVE Ledger is a free desktop app that pulls the wallets, assets, lost ships and skills of all your EVE Online characters from ESI and answers that at a glance. It runs entirely on your computer.
 
-[Español](#español) · [Download](../../releases/latest) · Windows · macOS (Apple Silicon) · Linux · English / Español / Deutsch
+[Español](#español) · [Download](../../releases/latest) · [Changelog](CHANGELOG.md) · Windows · macOS (Apple Silicon) · Linux · English / Español / Deutsch
 
 ![EVE Ledger dashboard: net result for the period, today, net by activity and lost ships](docs/brochure/shot-dashboard-en.jpg)
 
@@ -20,6 +20,7 @@
   - Ratting ISK per hour by character and by system.
   - Your lost ships measured in hours of ratting.
   - Market fees and taxes.
+  - Deductions from what you earn: the corporation tax on bounties, ESS and missions (exact, from the journal) and the bounty penalty in incursion systems (an estimate).
 - **Balances.** Your numbers presented as books: a balance sheet, an income statement and a wallet reconciliation that adds up to the ISK.
 - **Your history, kept.** ESI only serves about 30 days of wallet history, so EVE Ledger stores everything it syncs.
   - It runs in the system tray and can start when you sign in, syncing every hour.
@@ -51,9 +52,10 @@
    - **Windows:** `.exe` or `.msi`
    - **macOS** (Apple Silicon): `.dmg`
    - **Linux:** `.deb` or `.AppImage`
-2. The installers aren't code-signed yet:
-   - **Windows:** SmartScreen shows a warning; choose **More info → Run anyway**.
-   - **macOS:** the first time, right-click the app and choose **Open**.
+2. The installers aren't code-signed: EVE Ledger is a free, open project, and signing certificates cost money every year. They're built in public by GitHub Actions from this repository, and every release lists how to check that a download came from here (SHA-256 sums and GitHub's build attestation). Your system warns you the first time:
+   - **Windows:** SmartScreen says "Windows protected your PC"; choose **More info → Run anyway**.
+   - **macOS:** if it says the app can't be opened or "is damaged", open **System Settings → Privacy & Security** and choose **Open Anyway** (on older macOS, right-click the app and choose **Open**). If that's not enough, run `xattr -cr "/Applications/EVE Ledger.app"` in Terminal.
+   - **Linux (.AppImage):** make it executable (`chmod +x`) and open it.
    - **Linux:** the tray icon needs AppIndicator. On plain GNOME, install the *AppIndicator and KStatusNotifierItem Support* extension.
 3. On first run, a short setup asks for your preferences:
    - how many pilots you'll link;
